@@ -76,7 +76,7 @@ class MessageBatcher:
         key = (user_id, thread_id)
         entries = self._buffers.pop(key, [])
         elapsed = time.monotonic() - self._start_times.pop(key, time.monotonic())
-        if not entries:
+        if not entries or elapsed < 5.0:
             return
         text = _format_batch(entries, elapsed)
         chat_id = session_manager.resolve_chat_id(user_id, thread_id)

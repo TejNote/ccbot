@@ -96,6 +96,10 @@ class Config:
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Batch tool_use/tool_result/thinking messages into one summary per N seconds
+        # Set to 0.0 to disable batching (sends each message individually)
+        self.batch_window = float(os.getenv("CCBOT_BATCH_WINDOW", "0.0"))
+
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"

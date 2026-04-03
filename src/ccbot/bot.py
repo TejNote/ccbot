@@ -130,6 +130,7 @@ from .markdown_v2 import convert_markdown
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
+from .message_batcher import batcher
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
@@ -1771,6 +1772,14 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if not config.show_tool_calls and msg.content_type in ("tool_use", "tool_result"):
             continue
 
+        # Batch tool_use/tool_result/thinking when CCBOT_BATCH_WINDOW > 0
+        if config.batch_window > 0:
+            if msg.content_type in ("tool_use", "tool_result", "thinking"):
+                batcher.add(user_id, thread_id, msg.tool_name, msg.content_type, msg.text)
+                continue
+            if msg.content_type == "text" and msg.is_complete and msg.role == "assistant":
+                await batcher.flush_and_send(bot, user_id, thread_id)
+
         parts = build_response_parts(
             msg.text,
             msg.is_complete,
@@ -1852,6 +1861,9 @@ async def post_init(application: Application) -> None:
     session_monitor = monitor
     logger.info("Session monitor started")
 
+    if config.batch_window > 0:
+        batcher.start(application.bot, config.batch_window)
+
     # Start status polling task
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
@@ -1869,6 +1881,8 @@ async def post_shutdown(application: Application) -> None:
             pass
         _status_poll_task = None
         logger.info("Status polling stopped")
+
+    batcher.stop()
 
     # Stop all queue workers
     await shutdown_workers()

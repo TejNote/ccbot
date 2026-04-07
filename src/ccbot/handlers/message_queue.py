@@ -321,6 +321,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     link_preview_options=NO_LINK_PREVIEW,
                 )
                 await _send_task_images(bot, chat_id, task)
+                await asyncio.sleep(0.15)  # Wait for Claude TUI to update status
                 await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
@@ -336,6 +337,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         link_preview_options=NO_LINK_PREVIEW,
                     )
                     await _send_task_images(bot, chat_id, task)
+                    await asyncio.sleep(0.15)  # Wait for Claude TUI to update status
                     await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
@@ -382,6 +384,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     await _send_task_images(bot, chat_id, task)
 
     # 5. After content, check and send status
+    await asyncio.sleep(0.15)  # Wait for Claude TUI to update status after response
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
 
 

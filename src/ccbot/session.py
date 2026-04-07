@@ -33,6 +33,7 @@ from typing import Any
 import aiofiles
 
 from .config import config
+from .terminal_parser import parse_status_line
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import atomic_write_json
@@ -823,6 +824,15 @@ class SessionManager:
         window = await tmux_manager.find_window_by_id(window_id)
         if not window:
             return False, "Window not found (may have been closed)"
+
+        # Check if Claude is currently generating a response.
+        # Claude TUI ignores key input while working, causing commands to be silently dropped.
+        pane_text = await tmux_manager.capture_pane(window.window_id)
+        if pane_text:
+            status = parse_status_line(pane_text)
+            if status and "esc to interrupt" in status.lower():
+                return False, "Claude가 응답 생성 중입니다. 완료 후 다시 시도해주세요."
+
         success = await tmux_manager.send_keys(window.window_id, text)
         if success:
             return True, f"Sent to {display}"

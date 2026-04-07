@@ -216,8 +216,25 @@ def hook_main() -> None:
         )
         return
     tmux_session_name, window_id, window_name = parts
+
+    # Use canonical session name from .ccbot/.env (TMUX_SESSION_NAME) if set.
+    # This handles tmux group session copies (ccbot-15, ccbot-12, etc.) which
+    # would otherwise record keys like "ccbot-15:@4" that the bot ignores.
+    from .utils import ccbot_dir as _ccbot_dir
+
+    _env_file = _ccbot_dir() / ".env"
+    canonical_session = tmux_session_name  # fallback: current tmux session name
+    if _env_file.exists():
+        for _line in _env_file.read_text().splitlines():
+            _line = _line.strip()
+            if _line.startswith("TMUX_SESSION_NAME="):
+                _val = _line.split("=", 1)[1].strip()
+                if _val:
+                    canonical_session = _val
+                break
+
     # Key uses window_id for uniqueness
-    session_window_key = f"{tmux_session_name}:{window_id}"
+    session_window_key = f"{canonical_session}:{window_id}"
 
     logger.debug(
         "tmux key=%s, window_name=%s, session_id=%s, cwd=%s",

@@ -228,7 +228,7 @@ def hook_main() -> None:
         for _line in _env_file.read_text().splitlines():
             _line = _line.strip()
             if _line.startswith("TMUX_SESSION_NAME="):
-                _val = _line.split("=", 1)[1].strip()
+                _val = _line.split("=", 1)[1].strip().strip("\"'")
                 if _val:
                     canonical_session = _val
                 break
@@ -245,8 +245,6 @@ def hook_main() -> None:
     )
 
     # Read-modify-write with file locking to prevent concurrent hook races
-    from .utils import ccbot_dir
-
     map_file = ccbot_dir() / "session_map.json"
     map_file.parent.mkdir(parents=True, exist_ok=True)
 

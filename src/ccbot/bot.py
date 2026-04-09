@@ -151,28 +151,90 @@ _status_poll_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
-    "clear": "↗ Clear conversation history",
-    "compact": "↗ Compact conversation context",
-    "cost": "↗ Show token/cost usage",
-    "help": "↗ Show Claude Code help",
-    "memory": "↗ Edit CLAUDE.md",
-    "model": "↗ Switch AI model",
+    "clear": "↗ 대화 기록 초기화",
+    "compact": "↗ 컨텍스트 압축",
+    "cost": "↗ 토큰/비용 확인",
+    "help": "↗ Claude Code 도움말",
+    "memory": "↗ CLAUDE.md 편집",
+    "model": "↗ AI 모델 전환",
 }
 
 _skill_registry: SkillRegistry | None = None
+
+# Korean descriptions for known skills (command_name → description)
+_SKILL_DESC_KO: dict[str, str] = {
+    # superpowers
+    "brainstorming": "브레인스토밍 — 기능 설계 전 아이디어 구체화",
+    "writing_plans": "구현 계획 작성",
+    "executing_plans": "구현 계획 실행",
+    "systematic_debugging": "체계적 디버깅",
+    "test_driven_development": "TDD — 테스트 주도 개발",
+    "requesting_code_review": "코드 리뷰 요청",
+    "receiving_code_review": "코드 리뷰 피드백 적용",
+    "dispatching_parallel_agents": "병렬 에이전트 분산",
+    "using_git_worktrees": "Git worktree 격리 작업",
+    "finishing_a_development_branch": "개발 브랜치 마무리",
+    "using_superpowers": "Superpowers 스킬 안내",
+    "verification_before_completion": "완료 전 검증",
+    "writing_skills": "새 스킬 작성",
+    "subagent_driven_development": "서브에이전트 기반 개발",
+    # nestjs-hexagonal
+    "domain": "NestJS 도메인 레이어 (Entity, VO, Event)",
+    "application": "NestJS 애플리케이션 레이어 (UseCase, CQRS)",
+    "infrastructure": "NestJS 인프라 레이어 (Repository, Module)",
+    "presentation": "NestJS 프레젠테이션 레이어 (Controller, DTO)",
+    "create_subdomain": "NestJS 바운디드 컨텍스트 생성",
+    "event_listeners": "NestJS 도메인 이벤트 리스너",
+    "review_subdomain": "NestJS 헥사고날 아키텍처 리뷰",
+    "using_nestjs_hexagonal": "NestJS 헥사고날 라우터",
+    "websocket_broadcasting": "WebSocket 브로드캐스팅",
+    "gsd_installer": "GSD 워크플로 설정",
+    # figma
+    "figma_use": "Figma 파일 읽기 (필수 전처리)",
+    "figma_implement_design": "Figma → 코드 구현",
+    "figma_generate_design": "코드 → Figma 디자인 생성",
+    "figma_generate_library": "Figma 디자인 시스템 빌드",
+    "figma_code_connect": "Figma Code Connect 매핑",
+    "figma_create_new_file": "Figma 새 파일 생성",
+    "figma_create_design_system": "Figma 디자인 시스템 규칙 생성",
+    # frontend-design
+    "frontend_design": "프론트엔드 UI 디자인 구현",
+    # octo
+    "skill_debug": "Octo 디버깅",
+    "skill_tdd": "Octo TDD",
+    "skill_code_review": "Octo 코드 리뷰",
+    "skill_prd": "Octo PRD 작성",
+    "skill_audit": "Octo 보안 감사",
+    "skill_deck": "Octo 슬라이드 덱 생성",
+    "skill_parallel_agents": "Octo 병렬 에이전트",
+    "octopus_quick": "Octo 빠른 실행",
+    "octopus_quick_review": "Octo 빠른 리뷰",
+    "octopus_architecture": "Octo 아키텍처 설계",
+    "octopus_security_audit": "Octo 보안 감사",
+    "flow_discover": "Octo 발견 단계",
+    "flow_define": "Octo 정의 단계",
+    "flow_develop": "Octo 개발 단계",
+    "flow_deliver": "Octo 배포 단계",
+    "flow_spec": "Octo 스펙 작성",
+    "skill_debate": "Octo AI 토론",
+    # pr-review-toolkit
+    "skill_staged_review": "단계별 코드 리뷰",
+    "skill_finish_branch": "브랜치 마무리",
+    "skill_validate": "스킬 검증",
+}
 
 
 def _build_bot_commands() -> list[BotCommand]:
     """Build the full list of bot commands: built-in + CC + skills."""
     commands = [
-        BotCommand("start", "Show welcome message"),
-        BotCommand("history", "Message history for this topic"),
-        BotCommand("screenshot", "Terminal screenshot with control keys"),
-        BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("kill", "Kill session and delete topic"),
-        BotCommand("unbind", "Unbind topic from session (keeps window running)"),
-        BotCommand("usage", "Show Claude Code usage remaining"),
-        BotCommand("favorite", "Toggle skill favorites"),
+        BotCommand("start", "환영 메시지"),
+        BotCommand("history", "메시지 히스토리"),
+        BotCommand("screenshot", "터미널 스크린샷"),
+        BotCommand("esc", "Claude 인터럽트 (Escape)"),
+        BotCommand("kill", "세션 종료 + 토픽 삭제"),
+        BotCommand("unbind", "토픽-세션 바인딩 해제"),
+        BotCommand("usage", "Claude Code 사용량 확인"),
+        BotCommand("favorite", "스킬 즐겨찾기 토글"),
     ]
     for cmd_name, desc in CC_COMMANDS.items():
         commands.append(BotCommand(cmd_name, desc))
@@ -184,7 +246,11 @@ def _build_bot_commands() -> list[BotCommand]:
         skills = _skill_registry.get_sorted_skills()[:remaining]
         max_desc = max(10, desc_budget // len(skills)) if skills else 0
         for skill in skills:
-            desc = f"↗ {skill.description}"[:max_desc]
+            ko = _SKILL_DESC_KO.get(skill.command)
+            if ko:
+                desc = f"↗ {ko}"[:max_desc]
+            else:
+                desc = f"↗ {skill.description}"[:max_desc]
             commands.append(BotCommand(skill.command, desc))
     return commands
 

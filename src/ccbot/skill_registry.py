@@ -61,29 +61,29 @@ class SkillRegistry:
 
         # Collect raw skill entries: (plugin_name, skill_name, description)
         raw: list[tuple[str, str, str]] = []
-        for marketplace_dir in self._plugins_dir.iterdir():
+        for marketplace_dir in sorted(self._plugins_dir.iterdir()):
             if not marketplace_dir.is_dir():
                 continue
-            for plugin_dir in marketplace_dir.iterdir():
+            for plugin_dir in sorted(marketplace_dir.iterdir()):
                 if not plugin_dir.is_dir():
                     continue
                 plugin_name = plugin_dir.name
-                # Find the version directory (take the first one)
-                for version_dir in plugin_dir.iterdir():
-                    if not version_dir.is_dir():
+                # Pick the latest version directory only
+                version_dir = self._latest_version_dir(plugin_dir)
+                if not version_dir:
+                    continue
+                skills_dir = version_dir / "skills"
+                if not skills_dir.is_dir():
+                    continue
+                for skill_dir in sorted(skills_dir.iterdir()):
+                    if not skill_dir.is_dir():
                         continue
-                    skills_dir = version_dir / "skills"
-                    if not skills_dir.is_dir():
+                    skill_md = skill_dir / "SKILL.md"
+                    if not skill_md.is_file():
                         continue
-                    for skill_dir in skills_dir.iterdir():
-                        if not skill_dir.is_dir():
-                            continue
-                        skill_md = skill_dir / "SKILL.md"
-                        if not skill_md.is_file():
-                            continue
-                        name, description = self._parse_skill_md(skill_md)
-                        if name and description:
-                            raw.append((plugin_name, name, description))
+                    name, description = self._parse_skill_md(skill_md)
+                    if name and description:
+                        raw.append((plugin_name, name, description))
 
         # Convert to commands and detect collisions
         command_map: dict[str, list[tuple[str, str, str]]] = {}
@@ -122,6 +122,27 @@ class SkillRegistry:
         self._skills = skills
         logger.info("Scanned %d skills from %s", len(skills), self._plugins_dir)
         return list(skills.values())
+
+    @staticmethod
+    def _latest_version_dir(plugin_dir: Path) -> Path | None:
+        """Pick the latest version directory from a plugin package.
+
+        Tries semver sorting first, falls back to lexicographic.
+        Returns None if no valid directory found.
+        """
+        candidates = [d for d in plugin_dir.iterdir() if d.is_dir()]
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        def version_key(d: Path) -> tuple[int, ...]:
+            try:
+                return tuple(int(x) for x in d.name.split("."))
+            except ValueError:
+                return (0,)
+
+        return max(candidates, key=version_key)
 
     @staticmethod
     def _parse_skill_md(path: Path) -> tuple[str, str]:

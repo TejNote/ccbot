@@ -29,6 +29,9 @@ In fact, CCBot itself was built this way — iterating on itself through Claude 
 - **Voice messages** — Voice messages are transcribed via OpenAI and forwarded as text
 - **Send messages** — Forward text to Claude Code via tmux keystrokes
 - **Slash command forwarding** — Send any `/command` directly to Claude Code (e.g. `/clear`, `/compact`, `/cost`)
+- **Plugin skill menu** — Installed Claude Code plugin skills (superpowers, pr-review-toolkit, etc.) are auto-discovered and registered in the Telegram `/` command menu
+- **Skill favorites** — Toggle favorites via `/favorite` to pin frequently-used skills to the top of the menu
+- **Usage-based sorting** — Skills are sorted by per-project usage frequency, so your most-used skills surface first
 - **Create new sessions** — Start Claude Code sessions from Telegram via directory browser
 - **Resume sessions** — Pick up where you left off by resuming an existing Claude session in a directory
 - **Kill sessions** — Close a topic to auto-kill the associated tmux window
@@ -151,6 +154,7 @@ uv run ccbot
 | `/history`    | Message history for this topic  |
 | `/screenshot` | Capture terminal screenshot     |
 | `/esc`        | Send Escape to interrupt Claude |
+| `/favorite`   | Toggle skill favorites          |
 
 **Claude Code commands (forwarded via tmux):**
 
@@ -163,6 +167,20 @@ uv run ccbot
 | `/memory`  | Edit CLAUDE.md               |
 
 Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/review`, `/doctor`, `/init`).
+
+**Plugin skills (auto-discovered):**
+
+Installed Claude Code plugins are automatically scanned at startup. Their skills appear in the Telegram `/` command menu alongside built-in commands. For example, if you have `superpowers` installed:
+
+| Command              | Description                               |
+| -------------------- | ----------------------------------------- |
+| `/brainstorming`     | ↗ Design features through collaborative dialogue |
+| `/systematic_debugging` | ↗ Debug issues systematically          |
+| `/writing_plans`     | ↗ Write implementation plans             |
+| `/test_driven_development` | ↗ TDD workflow                     |
+| ...                  | (all installed plugin skills)             |
+
+Use `/favorite` to pin your most-used skills to the top of the menu.
 
 ### Topic Workflow
 
@@ -243,6 +261,7 @@ The window must be in the `ccbot` tmux session (configurable via `TMUX_SESSION_N
 | `$CCBOT_DIR/state.json`         | Thread bindings, window states, display names, and per-user read offsets |
 | `$CCBOT_DIR/session_map.json`   | Hook-generated `{tmux_session:window_id: {session_id, cwd, window_name}}` mappings |
 | `$CCBOT_DIR/monitor_state.json` | Monitor byte offsets per session (prevents duplicate notifications)     |
+| `$CCBOT_DIR/skill_state.json`  | Skill favorites and per-project usage counts                            |
 | `~/.claude/projects/`           | Claude Code session data (read-only)                                    |
 
 ## File Structure
@@ -262,6 +281,7 @@ src/ccbot/
 ├── html_converter.py      # Markdown → Telegram HTML conversion + HTML-aware splitting
 ├── screenshot.py          # Terminal text → PNG image with ANSI color support
 ├── transcribe.py          # Voice-to-text transcription via OpenAI API
+├── skill_registry.py      # Plugin skill discovery and Telegram command registration
 ├── utils.py               # Shared utilities (atomic JSON writes, JSONL helpers)
 ├── tmux_manager.py        # Tmux window management (list, create, send keys, kill)
 ├── fonts/                 # Bundled fonts for screenshot rendering

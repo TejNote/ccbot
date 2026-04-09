@@ -58,6 +58,7 @@ from telegram.ext import (
 )
 
 from .config import config
+from .skill_registry import SkillRegistry
 from .handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -73,6 +74,7 @@ from .handlers.callback_data import (
     CB_DIR_PAGE,
     CB_DIR_SELECT,
     CB_DIR_UP,
+    CB_FAV_TOGGLE,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_SESSION_CANCEL,
@@ -156,6 +158,28 @@ CC_COMMANDS: dict[str, str] = {
     "memory": "↗ Edit CLAUDE.md",
     "model": "↗ Switch AI model",
 }
+
+_skill_registry: SkillRegistry | None = None
+
+
+def _build_bot_commands() -> list[BotCommand]:
+    """Build the full list of bot commands: built-in + CC + skills."""
+    commands = [
+        BotCommand("start", "Show welcome message"),
+        BotCommand("history", "Message history for this topic"),
+        BotCommand("screenshot", "Terminal screenshot with control keys"),
+        BotCommand("esc", "Send Escape to interrupt Claude"),
+        BotCommand("kill", "Kill session and delete topic"),
+        BotCommand("unbind", "Unbind topic from session (keeps window running)"),
+        BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("favorite", "Toggle skill favorites"),
+    ]
+    for cmd_name, desc in CC_COMMANDS.items():
+        commands.append(BotCommand(cmd_name, desc))
+    if _skill_registry:
+        for skill in _skill_registry.get_sorted_skills():
+            commands.append(BotCommand(skill.command, f"↗ {skill.description}"))
+    return commands
 
 
 def is_user_allowed(user_id: int | None) -> bool:
@@ -350,6 +374,49 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"```\n{trimmed}\n```")
 
 
+async def favorite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show skill list with favorite toggles."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+    if not _skill_registry:
+        await safe_reply(update.message, "❌ No skills registered.")
+        return
+
+    skills = _skill_registry.get_sorted_skills()
+    if not skills:
+        await safe_reply(update.message, "❌ No skills found.")
+        return
+
+    keyboard = _build_favorite_keyboard()
+    await safe_reply(
+        update.message,
+        "⭐ Toggle skill favorites:",
+        reply_markup=keyboard,
+    )
+
+
+def _build_favorite_keyboard() -> InlineKeyboardMarkup:
+    """Build inline keyboard for favorite toggles."""
+    assert _skill_registry is not None
+    skills = _skill_registry.get_sorted_skills()
+    buttons: list[list[InlineKeyboardButton]] = []
+    for skill in skills:
+        prefix = "⭐ " if _skill_registry.is_favorite(skill.command) else ""
+        label = f"{prefix}{skill.name}"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{CB_FAV_TOGGLE}{skill.command}"[:64],
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons)
+
+
 # --- Screenshot keyboard with quick control keys ---
 
 # key_id → (tmux_key, enter, literal)
@@ -516,6 +583,18 @@ async def forward_command_handler(
         display = session_manager.get_display_name(wid)
         await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
         return
+
+    # Convert skill commands to original slash commands
+    if _skill_registry:
+        cmd_name = cc_slash.lstrip("/").split()[0]
+        if _skill_registry.is_skill(cmd_name):
+            original_slash = _skill_registry.get_slash_command(cmd_name)
+            # Preserve any arguments after the command
+            args = cc_slash.split(None, 1)[1] if " " in cc_slash else ""
+            cc_slash = f"{original_slash} {args}".rstrip()
+            # Record usage
+            ws = session_manager.get_window_state(wid)
+            _skill_registry.record_usage(cmd_name, ws.cwd or None)
 
     display = session_manager.get_display_name(wid)
     logger.info(
@@ -1561,6 +1640,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             logger.error(f"Failed to refresh screenshot: {e}")
             await query.answer("Failed to refresh", show_alert=True)
 
+    # Favorite toggle
+    elif data.startswith(CB_FAV_TOGGLE):
+        cmd = data[len(CB_FAV_TOGGLE) :]
+        if _skill_registry and _skill_registry.is_skill(cmd):
+            is_fav = _skill_registry.toggle_favorite(cmd)
+            label = "⭐ Added to favorites" if is_fav else "Removed from favorites"
+            await query.answer(label)
+            # Rebuild keyboard with updated stars
+            keyboard = _build_favorite_keyboard()
+            await safe_edit(
+                query,
+                "⭐ Toggle skill favorites:",
+                reply_markup=keyboard,
+            )
+            # Re-register commands with new order
+            new_commands = _build_bot_commands()
+            await context.bot.set_my_commands(new_commands)
+        else:
+            await query.answer("Unknown skill")
+
     elif data == "noop":
         await query.answer()
 
@@ -1769,15 +1868,24 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await clear_interactive_msg(user_id, bot, thread_id)
 
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in ("tool_use", "tool_result"):
+        if not config.show_tool_calls and msg.content_type in (
+            "tool_use",
+            "tool_result",
+        ):
             continue
 
         # Batch tool_use/tool_result/thinking when CCBOT_BATCH_WINDOW > 0
         if config.batch_window > 0:
             if msg.content_type in ("tool_use", "tool_result", "thinking"):
-                batcher.add(user_id, thread_id, msg.tool_name, msg.content_type, msg.text)
+                batcher.add(
+                    user_id, thread_id, msg.tool_name, msg.content_type, msg.text
+                )
                 continue
-            if msg.content_type == "text" and msg.is_complete and msg.role == "assistant":
+            if (
+                msg.content_type == "text"
+                and msg.is_complete
+                and msg.role == "assistant"
+            ):
                 await batcher.flush_and_send(bot, user_id, thread_id)
 
         parts = build_response_parts(
@@ -1818,23 +1926,18 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global session_monitor, _status_poll_task, _skill_registry
 
     await application.bot.delete_my_commands()
 
-    bot_commands = [
-        BotCommand("start", "Show welcome message"),
-        BotCommand("history", "Message history for this topic"),
-        BotCommand("screenshot", "Terminal screenshot with control keys"),
-        BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("kill", "Kill session and delete topic"),
-        BotCommand("unbind", "Unbind topic from session (keeps window running)"),
-        BotCommand("usage", "Show Claude Code usage remaining"),
-    ]
-    # Add Claude Code slash commands
-    for cmd_name, desc in CC_COMMANDS.items():
-        bot_commands.append(BotCommand(cmd_name, desc))
+    # Initialize skill registry and scan plugins
+    _skill_registry = SkillRegistry(
+        plugins_dir=Path.home() / ".claude" / "plugins" / "cache",
+        state_path=config.config_dir / "skill_state.json",
+    )
+    _skill_registry.scan()
 
+    bot_commands = _build_bot_commands()
     await application.bot.set_my_commands(bot_commands)
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
@@ -1910,6 +2013,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("favorite", favorite_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(

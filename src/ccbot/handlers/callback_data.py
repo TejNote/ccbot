@@ -49,3 +49,6 @@ CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+# Favorite toggle
+CB_FAV_TOGGLE = "fav:"  # fav:<command>

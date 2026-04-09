@@ -117,6 +117,7 @@ from .handlers.interactive_ui import (
 from .handlers.message_queue import (
     clear_status_msg_info,
     enqueue_content_message,
+    enqueue_direct_message,
     enqueue_status_update,
     get_message_queue,
     shutdown_workers,
@@ -676,7 +677,14 @@ async def forward_command_handler(
     await update.message.chat.send_action(ChatAction.TYPING)
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
-        await safe_reply(update.message, f"⚡ [{display}] Sent: {cc_slash}")
+        chat_id = chat.id if chat else user.id
+        await enqueue_direct_message(
+            bot=context.bot,
+            user_id=user.id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            text=f"⚡ [{display}] Sent: {cc_slash}",
+        )
         # If /clear command was sent, clear the session association
         # so we can detect the new session after first message
         if cc_slash.strip().lower() == "/clear":
@@ -781,7 +789,14 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     # Confirm to user
-    await safe_reply(update.message, "📷 Image sent to Claude Code.")
+    chat_id = chat.id if chat else user.id
+    await enqueue_direct_message(
+        bot=context.bot,
+        user_id=user.id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        text="📷 Image sent to Claude Code.",
+    )
 
 
 async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -857,7 +872,14 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"❌ {message}")
         return
 
-    await safe_reply(update.message, f'🎤 "{text}"')
+    chat_id = chat.id if chat else user.id
+    await enqueue_direct_message(
+        bot=context.bot,
+        user_id=user.id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        text=f'🎤 "{text}"',
+    )
 
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task

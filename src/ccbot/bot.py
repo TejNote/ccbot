@@ -178,7 +178,8 @@ def _build_bot_commands() -> list[BotCommand]:
         commands.append(BotCommand(cmd_name, desc))
     if _skill_registry:
         for skill in _skill_registry.get_sorted_skills():
-            commands.append(BotCommand(skill.command, f"↗ {skill.description}"))
+            desc = f"↗ {skill.description}"[:256]
+            commands.append(BotCommand(skill.command, desc))
     return commands
 
 

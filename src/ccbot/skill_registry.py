@@ -82,7 +82,7 @@ class SkillRegistry:
                         if not skill_md.is_file():
                             continue
                         name, description = self._parse_skill_md(skill_md)
-                        if name:
+                        if name and description:
                             raw.append((plugin_name, name, description))
 
         # Convert to commands and detect collisions

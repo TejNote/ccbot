@@ -148,13 +148,16 @@ uv run ccbot
 
 **Bot commands:**
 
-| Command       | Description                     |
-| ------------- | ------------------------------- |
-| `/start`      | Show welcome message            |
-| `/history`    | Message history for this topic  |
-| `/screenshot` | Capture terminal screenshot     |
-| `/esc`        | Send Escape to interrupt Claude |
-| `/favorite`   | Toggle skill favorites          |
+| Command       | Description                        |
+| ------------- | ---------------------------------- |
+| `/start`      | Show welcome message               |
+| `/history`    | Message history for this topic     |
+| `/screenshot` | Capture terminal screenshot        |
+| `/esc`        | Send Escape to interrupt Claude    |
+| `/kill`       | Kill session and delete topic      |
+| `/unbind`     | Unbind topic from session          |
+| `/usage`      | Show Claude Code usage remaining   |
+| `/favorite`   | Toggle skill favorites             |
 
 **Claude Code commands (forwarded via tmux):**
 
@@ -165,20 +168,22 @@ uv run ccbot
 | `/cost`    | Show token/cost usage        |
 | `/help`    | Show Claude Code help        |
 | `/memory`  | Edit CLAUDE.md               |
+| `/model`   | Switch AI model              |
 
 Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/review`, `/doctor`, `/init`).
 
 **Plugin skills (auto-discovered):**
 
-Installed Claude Code plugins are automatically scanned at startup. Their skills appear in the Telegram `/` command menu alongside built-in commands. For example, if you have `superpowers` installed:
+Installed Claude Code plugins are automatically scanned at startup. Their skills appear in the Telegram `/` command menu alongside built-in commands. Skills with Korean translations show localized descriptions. For example:
 
-| Command              | Description                               |
-| -------------------- | ----------------------------------------- |
-| `/brainstorming`     | ↗ Design features through collaborative dialogue |
-| `/systematic_debugging` | ↗ Debug issues systematically          |
-| `/writing_plans`     | ↗ Write implementation plans             |
-| `/test_driven_development` | ↗ TDD workflow                     |
-| ...                  | (all installed plugin skills)             |
+| Command                    | Description                    |
+| -------------------------- | ------------------------------ |
+| `/brainstorming`           | ↗ 브레인스토밍 — 기능 설계 전 아이디어 구체화 |
+| `/systematic_debugging`    | ↗ 체계적 디버깅                |
+| `/writing_plans`           | ↗ 구현 계획 작성              |
+| `/test_driven_development` | ↗ TDD — 테스트 주도 개발      |
+| `/skill_debug`             | ↗ Octo 디버깅                 |
+| ...                        | (all installed plugin skills)  |
 
 Use `/favorite` to pin your most-used skills to the top of the menu.
 
@@ -282,8 +287,10 @@ src/ccbot/
 ├── screenshot.py          # Terminal text → PNG image with ANSI color support
 ├── transcribe.py          # Voice-to-text transcription via OpenAI API
 ├── skill_registry.py      # Plugin skill discovery and Telegram command registration
+├── message_batcher.py     # Batch tool_use/thinking messages into summaries
 ├── utils.py               # Shared utilities (atomic JSON writes, JSONL helpers)
 ├── tmux_manager.py        # Tmux window management (list, create, send keys, kill)
+├── telegram_sender.py     # Telegram message splitting (4096 char limit)
 ├── fonts/                 # Bundled fonts for screenshot rendering
 └── handlers/
     ├── __init__.py        # Handler module exports

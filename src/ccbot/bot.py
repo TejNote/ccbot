@@ -177,10 +177,14 @@ def _build_bot_commands() -> list[BotCommand]:
     for cmd_name, desc in CC_COMMANDS.items():
         commands.append(BotCommand(cmd_name, desc))
     if _skill_registry:
-        # Telegram Bot API allows max 100 commands total
+        # Telegram Bot API has undocumented ~5000 char total description limit.
+        # Cap per-skill description to fit more skills within the budget.
         remaining = 100 - len(commands)
-        for skill in _skill_registry.get_sorted_skills()[:remaining]:
-            desc = f"↗ {skill.description}"[:256]
+        desc_budget = 5000 - sum(len(c.description) for c in commands)
+        skills = _skill_registry.get_sorted_skills()[:remaining]
+        max_desc = max(10, desc_budget // len(skills)) if skills else 0
+        for skill in skills:
+            desc = f"↗ {skill.description}"[:max_desc]
             commands.append(BotCommand(skill.command, desc))
     return commands
 

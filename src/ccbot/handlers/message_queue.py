@@ -66,8 +66,25 @@ class MessageTask:
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
 
 
+@dataclass
+class DirectMessage:
+    """Direct message to send through the queue for ordering guarantees.
+
+    Unlike ContentMessage (from JSONL monitor) and StatusUpdate (from polling),
+    this represents messages that were previously sent via safe_reply() directly,
+    bypassing the queue. Routing them through the queue ensures they appear
+    in correct order relative to Claude's responses.
+    """
+
+    chat_id: int
+    thread_id: int | None = None
+    text: str = ""
+    parse_mode: str | None = None
+    reply_markup: object | None = None  # InlineKeyboardMarkup
+
+
 # Per-user message queues and worker tasks
-_message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
+_message_queues: dict[int, asyncio.Queue[MessageTask | DirectMessage]] = {}
 _queue_workers: dict[int, asyncio.Task[None]] = {}
 _queue_locks: dict[int, asyncio.Lock] = {}  # Protect drain/refill operations
 
@@ -85,12 +102,16 @@ _flood_until: dict[int, float] = {}
 FLOOD_CONTROL_MAX_WAIT = 10
 
 
-def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
+def get_message_queue(
+    user_id: int,
+) -> asyncio.Queue[MessageTask | DirectMessage] | None:
     """Get the message queue for a user (if exists)."""
     return _message_queues.get(user_id)
 
 
-def get_or_create_queue(bot: Bot, user_id: int) -> asyncio.Queue[MessageTask]:
+def get_or_create_queue(
+    bot: Bot, user_id: int
+) -> asyncio.Queue[MessageTask | DirectMessage]:
     """Get or create message queue and worker for a user."""
     if user_id not in _message_queues:
         _message_queues[user_id] = asyncio.Queue()
@@ -207,15 +228,18 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
         try:
             task = await queue.get()
             try:
-                # Flood control: drop status, wait for content
+                # Flood control: drop status, wait for content/direct
                 flood_end = _flood_until.get(user_id, 0)
                 if flood_end > 0:
                     remaining = flood_end - time.monotonic()
                     if remaining > 0:
-                        if task.task_type != "content":
+                        if (
+                            isinstance(task, MessageTask)
+                            and task.task_type != "content"
+                        ):
                             # Status is ephemeral — safe to drop
                             continue
-                        # Content is actual Claude output — wait then send
+                        # Content/direct is actual output — wait then send
                         logger.debug(
                             "Flood controlled: waiting %.0fs for content (user %d)",
                             remaining,
@@ -226,7 +250,9 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     _flood_until.pop(user_id, None)
                     logger.info("Flood control lifted for user %d", user_id)
 
-                if task.task_type == "content":
+                if isinstance(task, DirectMessage):
+                    await _process_direct_message(bot, user_id, task)
+                elif task.task_type == "content":
                     # Try to merge consecutive content tasks
                     merged_task, merge_count = await _merge_content_tasks(
                         queue, task, lock
@@ -295,6 +321,40 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
         task.image_data,
         **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
     )
+
+
+async def _process_direct_message(bot: Bot, user_id: int, msg: DirectMessage) -> None:
+    """Send a direct message through the queue."""
+    kwargs = _send_kwargs(msg.thread_id)
+    if msg.reply_markup:
+        kwargs["reply_markup"] = msg.reply_markup
+    try:
+        if msg.parse_mode:
+            await bot.send_message(
+                chat_id=msg.chat_id,
+                text=msg.text,
+                parse_mode=msg.parse_mode,
+                link_preview_options=NO_LINK_PREVIEW,
+                **kwargs,
+            )
+        else:
+            await bot.send_message(
+                chat_id=msg.chat_id,
+                text=msg.text,
+                link_preview_options=NO_LINK_PREVIEW,
+                **kwargs,
+            )
+    except Exception:
+        # Fallback: try plain text without parse_mode
+        try:
+            await bot.send_message(
+                chat_id=msg.chat_id,
+                text=strip_sentinels(msg.text),
+                link_preview_options=NO_LINK_PREVIEW,
+                **kwargs,
+            )
+        except Exception as e:
+            logger.error("Failed to send direct message: %s", e)
 
 
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
@@ -662,6 +722,31 @@ async def enqueue_status_update(
         task = MessageTask(task_type="status_clear", thread_id=thread_id)
 
     queue.put_nowait(task)
+
+
+async def enqueue_direct_message(
+    bot: Bot,
+    user_id: int,
+    chat_id: int,
+    thread_id: int | None,
+    text: str,
+    parse_mode: str | None = None,
+    reply_markup: object | None = None,
+) -> None:
+    """Enqueue a direct message for ordered delivery.
+
+    Use this instead of safe_reply() for messages that may interleave
+    with Claude responses (command confirmations, photo/voice acks, etc.).
+    """
+    queue = get_or_create_queue(bot, user_id)
+    msg = DirectMessage(
+        chat_id=chat_id,
+        thread_id=thread_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+    queue.put_nowait(msg)
 
 
 def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:

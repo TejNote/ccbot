@@ -8,12 +8,15 @@ bot menu registration.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ccbot.utils import atomic_write_json
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,6 +56,7 @@ class SkillRegistry:
     def scan(self) -> list[SkillInfo]:
         """Scan plugins cache directory and return discovered skills."""
         if not self._plugins_dir.is_dir():
+            logger.warning("Plugins directory not found: %s", self._plugins_dir)
             return []
 
         # Collect raw skill entries: (plugin_name, skill_name, description)
@@ -116,6 +120,7 @@ class SkillRegistry:
                     skills[prefixed_cmd] = info
 
         self._skills = skills
+        logger.info("Scanned %d skills from %s", len(skills), self._plugins_dir)
         return list(skills.values())
 
     @staticmethod
@@ -150,6 +155,7 @@ class SkillRegistry:
         Hyphens become underscores, lowercase, max 32 chars.
         """
         cmd = name.lower().replace("-", "_")
+        cmd = re.sub(r"[^a-z0-9_]", "", cmd)
         return cmd[:32]
 
     def is_skill(self, command: str) -> bool:
@@ -159,7 +165,7 @@ class SkillRegistry:
     def get_slash_command(self, command: str) -> str:
         """Get original slash command for a Telegram command."""
         info = self._skills.get(command)
-        return info.slash_command if info else ""
+        return info.slash_command if info else f"/{command}"
 
     def record_usage(self, command: str, project_dir: str | None) -> None:
         """Record skill usage for a project directory."""

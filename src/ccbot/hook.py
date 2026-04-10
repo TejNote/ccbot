@@ -186,6 +186,26 @@ def hook_main() -> None:
         logger.debug("Ignoring non-SessionStart event: %s", event)
         return
 
+    # Skip non-interactive sessions (claude -p / --print).
+    # These are one-shot commands (e.g. daily-news-digest.sh) that inherit
+    # TMUX_PANE from the parent shell but should not overwrite session_map.
+    try:
+        ppid = os.getppid()
+        cmdline = Path(f"/proc/{ppid}/cmdline").read_bytes().decode(errors="ignore")
+    except (OSError, FileNotFoundError):
+        # macOS: no /proc, use ps instead
+        try:
+            ps_out = subprocess.run(
+                ["ps", "-o", "args=", "-p", str(os.getppid())],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            cmdline = ps_out
+        except Exception:
+            cmdline = ""
+    if any(flag in cmdline for flag in [" -p ", " --print ", " -p\x00", "\x00-p\x00"]):
+        logger.debug("Skipping non-interactive session (parent has -p/--print flag)")
+        return
+
     # Get tmux session:window key for the pane running this hook.
     # TMUX_PANE is set by tmux for every process inside a pane.
     pane_id = os.environ.get("TMUX_PANE", "")

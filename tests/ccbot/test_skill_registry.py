@@ -57,7 +57,11 @@ class TestScan:
 
         assert len(skills) == 3
         names = {s.name for s in skills}
-        assert names == {"brainstorming", "systematic-debugging", "code-reviewer"}
+        assert names == {
+            "superpowers:brainstorming",
+            "superpowers:systematic-debugging",
+            "pr-review-toolkit:code-reviewer",
+        }
 
     def test_scan_skips_non_skill_dirs(self, tmp_path: Path) -> None:
         plugins_dir = tmp_path / "cache"
@@ -89,7 +93,7 @@ class TestScan:
         skills = reg.scan()
 
         assert len(skills) == 1
-        assert skills[0].name == "brainstorming"
+        assert skills[0].name == "superpowers:brainstorming"
 
     def test_scan_handles_missing_dir(self, tmp_path: Path) -> None:
         plugins_dir = tmp_path / "nonexistent"
@@ -119,11 +123,12 @@ class TestCommandConversion:
         reg = SkillRegistry(plugins_dir, tmp_path / "state.json")
         reg.scan()
 
-        assert reg.get_slash_command("systematic_debugging") == "/systematic-debugging"
+        assert reg.get_slash_command("superpowers_systematic_debugging") == "/superpowers:systematic-debugging"
 
 
 class TestNameCollision:
-    def test_name_collision_adds_prefix(self, tmp_path: Path) -> None:
+    def test_no_collision_with_plugin_prefix(self, tmp_path: Path) -> None:
+        """Different plugins with same skill dir name get unique commands via plugin prefix."""
         plugins_dir = tmp_path / "cache"
         _make_skill_md(
             plugins_dir, "official", "plugin-a", "1.0.0", "review", "Review A"
@@ -234,11 +239,11 @@ class TestSorting:
 
         reg = SkillRegistry(plugins_dir, tmp_path / "state.json")
         reg.scan()
-        reg.toggle_favorite("zzz_skill")
+        reg.toggle_favorite("superpowers_zzz_skill")
 
         sorted_skills = reg.get_sorted_skills()
-        assert sorted_skills[0].command == "zzz_skill"
-        assert sorted_skills[1].command == "aaa_skill"
+        assert sorted_skills[0].command == "superpowers_zzz_skill"
+        assert sorted_skills[1].command == "superpowers_aaa_skill"
 
     def test_sorted_skills_usage_order(self, tmp_path: Path) -> None:
         plugins_dir = tmp_path / "cache"
@@ -253,10 +258,10 @@ class TestSorting:
         reg.scan()
 
         project = "/my/project"
-        reg.record_usage("zzz_skill", project)
-        reg.record_usage("zzz_skill", project)
-        reg.record_usage("aaa_skill", project)
+        reg.record_usage("superpowers_zzz_skill", project)
+        reg.record_usage("superpowers_zzz_skill", project)
+        reg.record_usage("superpowers_aaa_skill", project)
 
         sorted_skills = reg.get_sorted_skills(project_dir=project)
-        assert sorted_skills[0].command == "zzz_skill"
-        assert sorted_skills[1].command == "aaa_skill"
+        assert sorted_skills[0].command == "superpowers_zzz_skill"
+        assert sorted_skills[1].command == "superpowers_aaa_skill"

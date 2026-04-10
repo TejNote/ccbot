@@ -54,13 +54,17 @@ class SkillRegistry:
         atomic_write_json(self._state_path, self._state)
 
     def scan(self) -> list[SkillInfo]:
-        """Scan plugins cache directory and return discovered skills."""
+        """Scan plugins cache directory and return discovered skills.
+
+        Produces CLI-compatible slash commands in the form /plugin:skill-dir-name
+        (e.g. /superpowers:brainstorming, /octo:km). Telegram commands use
+        underscores: superpowers_brainstorming, octo_km.
+        """
         if not self._plugins_dir.is_dir():
             logger.warning("Plugins directory not found: %s", self._plugins_dir)
             return []
 
-        # Collect raw skill entries: (plugin_name, skill_name, description)
-        raw: list[tuple[str, str, str]] = []
+        skills: dict[str, SkillInfo] = {}
         for marketplace_dir in sorted(self._plugins_dir.iterdir()):
             if not marketplace_dir.is_dir():
                 continue
@@ -81,43 +85,28 @@ class SkillRegistry:
                     skill_md = skill_dir / "SKILL.md"
                     if not skill_md.is_file():
                         continue
-                    name, description = self._parse_skill_md(skill_md)
-                    if name and description:
-                        raw.append((plugin_name, name, description))
+                    _, description = self._parse_skill_md(skill_md)
+                    if not description:
+                        continue
 
-        # Convert to commands and detect collisions
-        command_map: dict[str, list[tuple[str, str, str]]] = {}
-        for plugin_name, skill_name, description in raw:
-            cmd = self._to_command(skill_name)
-            command_map.setdefault(cmd, []).append(
-                (plugin_name, skill_name, description)
-            )
+                    # Use directory name as skill identifier (matches CLI behavior)
+                    dir_name = skill_dir.name
+                    # CLI slash command: /plugin:dir-name
+                    slash_cmd = f"/{plugin_name}:{dir_name}"
+                    # Telegram command: plugin_dirname (hyphens→underscores)
+                    tg_cmd = self._to_command(f"{plugin_name}_{dir_name}")
 
-        skills: dict[str, SkillInfo] = {}
-        for cmd, entries in command_map.items():
-            if len(entries) == 1:
-                plugin_name, skill_name, description = entries[0]
-                info = SkillInfo(
-                    name=skill_name,
-                    command=cmd,
-                    description=description[:256],
-                    plugin=plugin_name,
-                    slash_command=f"/{skill_name}",
-                )
-                skills[cmd] = info
-            else:
-                # Name collision — prefix with shortened plugin name
-                for plugin_name, skill_name, description in entries:
-                    prefix = plugin_name[:10].lower().replace("-", "_")
-                    prefixed_cmd = self._to_command(f"{prefix}_{skill_name}")
-                    info = SkillInfo(
-                        name=skill_name,
-                        command=prefixed_cmd,
+                    if tg_cmd in skills:
+                        # Skip duplicates (shouldn't happen with plugin prefix)
+                        continue
+
+                    skills[tg_cmd] = SkillInfo(
+                        name=f"{plugin_name}:{dir_name}",
+                        command=tg_cmd,
                         description=description[:256],
                         plugin=plugin_name,
-                        slash_command=f"/{skill_name}",
+                        slash_command=slash_cmd,
                     )
-                    skills[prefixed_cmd] = info
 
         self._skills = skills
         logger.info("Scanned %d skills from %s", len(skills), self._plugins_dir)

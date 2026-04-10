@@ -56,9 +56,15 @@ class SkillRegistry:
     def scan(self) -> list[SkillInfo]:
         """Scan plugins cache directory and return discovered skills.
 
-        Produces CLI-compatible slash commands in the form /plugin:skill-dir-name
-        (e.g. /superpowers:brainstorming, /octo:km). Telegram commands use
-        underscores: superpowers_brainstorming, octo_km.
+        Scans both skills/ (SKILL.md) and commands/ (*.md) directories.
+        CLI slash commands use /plugin:name format (e.g. /octo:octo, /superpowers:brainstorming).
+        Telegram commands use underscores: octo_octo, superpowers_brainstorming.
+
+        For commands/, the filename determines the command name:
+          - octo plugin: octo-km.md → /octo:km, octo.md → /octo:octo
+          - claude-hud: setup.md → /claude-hud:setup
+        Deprecated commands (description contains "deprecated") are skipped.
+        Skills take priority over commands with the same resulting tg_cmd.
         """
         if not self._plugins_dir.is_dir():
             logger.warning("Plugins directory not found: %s", self._plugins_dir)
@@ -72,41 +78,78 @@ class SkillRegistry:
                 if not plugin_dir.is_dir():
                     continue
                 plugin_name = plugin_dir.name
-                # Pick the latest version directory only
                 version_dir = self._latest_version_dir(plugin_dir)
                 if not version_dir:
                     continue
+
+                # 1. Scan skills/ directory (SKILL.md files)
                 skills_dir = version_dir / "skills"
-                if not skills_dir.is_dir():
-                    continue
-                for skill_dir in sorted(skills_dir.iterdir()):
-                    if not skill_dir.is_dir():
-                        continue
-                    skill_md = skill_dir / "SKILL.md"
-                    if not skill_md.is_file():
-                        continue
-                    _, description = self._parse_skill_md(skill_md)
-                    if not description:
-                        continue
+                if skills_dir.is_dir():
+                    for skill_dir in sorted(skills_dir.iterdir()):
+                        if not skill_dir.is_dir():
+                            continue
+                        skill_md = skill_dir / "SKILL.md"
+                        if not skill_md.is_file():
+                            continue
+                        _, description = self._parse_skill_md(skill_md)
+                        if not description:
+                            continue
 
-                    # Use directory name as skill identifier (matches CLI behavior)
-                    dir_name = skill_dir.name
-                    # CLI slash command: /plugin:dir-name
-                    slash_cmd = f"/{plugin_name}:{dir_name}"
-                    # Telegram command: plugin_dirname (hyphens→underscores)
-                    tg_cmd = self._to_command(f"{plugin_name}_{dir_name}")
+                        dir_name = skill_dir.name
+                        slash_cmd = f"/{plugin_name}:{dir_name}"
+                        tg_cmd = self._to_command(f"{plugin_name}_{dir_name}")
 
-                    if tg_cmd in skills:
-                        # Skip duplicates (shouldn't happen with plugin prefix)
-                        continue
+                        if tg_cmd in skills:
+                            continue
 
-                    skills[tg_cmd] = SkillInfo(
-                        name=f"{plugin_name}:{dir_name}",
-                        command=tg_cmd,
-                        description=description[:256],
-                        plugin=plugin_name,
-                        slash_command=slash_cmd,
-                    )
+                        skills[tg_cmd] = SkillInfo(
+                            name=f"{plugin_name}:{dir_name}",
+                            command=tg_cmd,
+                            description=description[:256],
+                            plugin=plugin_name,
+                            slash_command=slash_cmd,
+                        )
+
+                # 2. Scan commands/ directory (*.md files)
+                commands_dir = version_dir / "commands"
+                if commands_dir.is_dir():
+                    for cmd_file in sorted(commands_dir.iterdir()):
+                        if not cmd_file.is_file() or cmd_file.suffix != ".md":
+                            continue
+                        _, description = self._parse_skill_md(cmd_file)
+                        if not description:
+                            continue
+                        # Skip deprecated commands
+                        if "deprecated" in description.lower():
+                            continue
+
+                        # Derive command name from filename
+                        # e.g. octo-km.md → km, octo.md → octo, setup.md → setup
+                        file_stem = cmd_file.stem
+                        # Strip plugin-name prefix if present
+                        # e.g. "octo-km" → "km", "octo" stays "octo"
+                        prefix = plugin_name + "-"
+                        if file_stem.startswith(prefix):
+                            cmd_name = file_stem[len(prefix):]
+                        elif file_stem == plugin_name:
+                            cmd_name = plugin_name
+                        else:
+                            cmd_name = file_stem
+
+                        slash_cmd = f"/{plugin_name}:{cmd_name}"
+                        tg_cmd = self._to_command(f"{plugin_name}_{cmd_name}")
+
+                        if tg_cmd in skills:
+                            # Skills take priority over commands
+                            continue
+
+                        skills[tg_cmd] = SkillInfo(
+                            name=f"{plugin_name}:{cmd_name}",
+                            command=tg_cmd,
+                            description=description[:256],
+                            plugin=plugin_name,
+                            slash_command=slash_cmd,
+                        )
 
         self._skills = skills
         logger.info("Scanned %d skills from %s", len(skills), self._plugins_dir)

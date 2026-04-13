@@ -14,6 +14,7 @@ Key classes: SessionMonitor, NewMessage, SessionInfo.
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -27,6 +28,8 @@ from .transcript_parser import TranscriptParser
 from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 @dataclass
@@ -84,6 +87,8 @@ class SessionMonitor:
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
+        # Cache for auto-detect: skip dir scan when tracked JSONL is actively growing
+        self._auto_detect_mtimes: dict[str, float] = {}  # window_key -> last_seen_mtime
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -466,6 +471,93 @@ class SessionMonitor:
 
         return current_map
 
+    async def _auto_detect_session_changes(self) -> bool:
+        """Detect session_id changes not caught by hook (e.g., /clear).
+
+        For each window in session_map, check if a newer main JSONL exists
+        in the project directory. If found, update session_map.json so the
+        monitor picks up the new session automatically.
+        """
+        if not config.session_map_file.exists():
+            return False
+
+        try:
+            async with aiofiles.open(config.session_map_file, "r") as f:
+                raw = await f.read()
+            session_map = json.loads(raw)
+        except (json.JSONDecodeError, OSError):
+            return False
+
+        prefix = f"{config.tmux_session_name}:"
+        changed = False
+
+        for key, info in session_map.items():
+            if not key.startswith(prefix):
+                continue
+
+            cwd = info.get("cwd", "")
+            current_sid = info.get("session_id", "")
+            if not cwd or not current_sid:
+                continue
+
+            # cwd → project dir (same convention as ~/.claude/projects/)
+            project_dir = self.projects_path / ("-" + cwd.strip("/").replace("/", "-"))
+            if not project_dir.exists():
+                continue
+
+            # Current tracked JSONL mtime
+            current_jsonl = project_dir / f"{current_sid}.jsonl"
+            try:
+                current_mtime = (
+                    current_jsonl.stat().st_mtime if current_jsonl.exists() else 0
+                )
+            except OSError:
+                current_mtime = 0
+
+            # Skip dir scan if tracked JSONL is still actively growing
+            last_seen = self._auto_detect_mtimes.get(key, 0)
+            if current_mtime > last_seen:
+                # File is growing → no need to scan for replacements
+                self._auto_detect_mtimes[key] = current_mtime
+                continue
+            # mtime unchanged → file is stale, scan for a newer session
+
+            # Find a newer main session JSONL
+            newest_sid = None
+            newest_mtime = current_mtime
+
+            for jsonl_file in project_dir.glob("*.jsonl"):
+                stem = jsonl_file.stem
+                if stem.startswith("agent-") or not _UUID_RE.match(stem):
+                    continue
+                try:
+                    file_mtime = jsonl_file.stat().st_mtime
+                except OSError:
+                    continue
+                if file_mtime > newest_mtime:
+                    newest_mtime = file_mtime
+                    newest_sid = stem
+
+            if newest_sid and newest_sid != current_sid:
+                logger.info(
+                    "Auto-detected session change for %s: %s -> %s",
+                    key,
+                    current_sid,
+                    newest_sid,
+                )
+                info["session_id"] = newest_sid
+                changed = True
+
+        if changed:
+            try:
+                async with aiofiles.open(config.session_map_file, "w") as f:
+                    await f.write(json.dumps(session_map, indent=2))
+            except OSError as e:
+                logger.error("Failed to update session_map.json: %s", e)
+                return False
+
+        return changed
+
     async def _monitor_loop(self) -> None:
         """Background loop for checking session updates.
 
@@ -485,6 +577,9 @@ class SessionMonitor:
             try:
                 # Load hook-based session map updates
                 await session_manager.load_session_map()
+
+                # Auto-detect session changes not caught by hook (/clear, etc.)
+                await self._auto_detect_session_changes()
 
                 # Detect session_map changes and cleanup replaced/removed sessions
                 current_map = await self._detect_and_cleanup_changes()

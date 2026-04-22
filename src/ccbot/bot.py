@@ -1240,17 +1240,6 @@ async def _create_and_bind_window(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
 
-            # Rename the topic to match the window name
-            resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
-            try:
-                await context.bot.edit_forum_topic(
-                    chat_id=resolved_chat,
-                    message_thread_id=pending_thread_id,
-                    name=created_wname,
-                )
-            except Exception as e:
-                logger.debug(f"Failed to rename topic: {e}")
-
             status = "Resumed" if resume_session_id else "Created"
             await safe_edit(
                 query,
@@ -1637,17 +1626,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         session_manager.bind_thread(
             user.id, thread_id, selected_wid, window_name=display
         )
-
-        # Rename the topic to match the window name
-        resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
-        try:
-            await context.bot.edit_forum_topic(
-                chat_id=resolved_chat,
-                message_thread_id=thread_id,
-                name=display,
-            )
-        except Exception as e:
-            logger.debug(f"Failed to rename topic: {e}")
 
         await safe_edit(
             query,

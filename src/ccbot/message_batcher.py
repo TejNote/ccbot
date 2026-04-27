@@ -4,6 +4,11 @@ When CCBOT_BATCH_WINDOW > 0, tool calls and thinking messages are buffered
 per (user_id, thread_id) and flushed as a single summary after N seconds,
 or immediately before a final text response.
 
+Summaries go through the per-user message queue (via enqueue_direct_message)
+to preserve FIFO ordering relative to Claude's content responses; bypassing
+the queue with a direct safe_send caused batch summaries to race against
+content messages and arrive out of order.
+
 Format:
     ⚙️ 작업 중 (10초간 6건)
     • Bash × 3
@@ -20,7 +25,7 @@ from dataclasses import dataclass
 
 from telegram import Bot
 
-from .handlers.message_sender import safe_send
+from .handlers.message_queue import enqueue_direct_message
 from .session import session_manager
 
 logger = logging.getLogger(__name__)
@@ -72,7 +77,11 @@ class MessageBatcher:
     async def flush_and_send(
         self, bot: Bot, user_id: int, thread_id: int | None
     ) -> None:
-        """Flush buffer and send summary. Called before a final text response."""
+        """Flush buffer and enqueue summary. Called before a final text response.
+
+        Routes through the per-user message queue so the summary keeps its
+        FIFO position relative to Claude's content responses.
+        """
         key = (user_id, thread_id)
         entries = self._buffers.pop(key, [])
         elapsed = time.monotonic() - self._start_times.pop(key, time.monotonic())
@@ -80,7 +89,7 @@ class MessageBatcher:
             return
         text = _format_batch(entries, elapsed)
         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-        await safe_send(bot, chat_id, text, message_thread_id=thread_id)
+        await enqueue_direct_message(bot, user_id, chat_id, thread_id, text)
 
     async def _timer_loop(self) -> None:
         """Periodically flush all non-empty buffers."""
@@ -91,15 +100,17 @@ class MessageBatcher:
             keys = list(self._buffers.keys())
             for key in keys:
                 entries = self._buffers.pop(key, [])
-                elapsed = time.monotonic() - self._start_times.pop(key, time.monotonic())
+                elapsed = time.monotonic() - self._start_times.pop(
+                    key, time.monotonic()
+                )
                 if not entries:
                     continue
                 user_id, thread_id = key
                 text = _format_batch(entries, elapsed)
                 try:
                     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-                    await safe_send(
-                        self._bot, chat_id, text, message_thread_id=thread_id
+                    await enqueue_direct_message(
+                        self._bot, user_id, chat_id, thread_id, text
                     )
                 except Exception as e:
                     logger.error("Batcher flush error for key %s: %s", key, e)

@@ -54,6 +54,29 @@ PARSE_MODE = "MarkdownV2"
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
+# Substrings in Telegram errors that mean the topic/thread is gone
+_TOPIC_GONE_MARKERS = ("Topic_id_invalid", "Message thread not found")
+
+
+async def _maybe_cleanup_dead_topic(
+    chat_id: int, kwargs: dict[str, Any], err: BaseException
+) -> None:
+    """If the error indicates a dead forum topic, tear down the binding.
+
+    Called from send fallbacks after both attempts have failed. Lazy-imports
+    session_manager to avoid a circular import at module load.
+    """
+    msg = str(err)
+    if not any(m in msg for m in _TOPIC_GONE_MARKERS):
+        return
+    thread_id = kwargs.get("message_thread_id")
+    if thread_id is None:
+        return
+    from ..session import session_manager  # lazy: avoid circular import
+
+    await session_manager.cleanup_dead_topic(int(chat_id), int(thread_id))
+
+
 async def send_with_fallback(
     bot: Bot,
     chat_id: int,
@@ -86,6 +109,7 @@ async def send_with_fallback(
             raise
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
+            await _maybe_cleanup_dead_topic(chat_id, kwargs, e)
             return None
     except Exception as e:
         # Any other error (TimedOut, NetworkError, ...) is ambiguous: on a slow
@@ -230,9 +254,14 @@ async def safe_send(
             raise
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
+            await _maybe_cleanup_dead_topic(chat_id, kwargs, e)
     except Exception as e:
         # Ambiguous error (e.g. TimedOut): the formatted send may already have
         # reached Telegram. Retrying would deliver a duplicate, so don't.
+        # 🔎 죽은 토픽 정리는 여기서 부르지 않는다 — Topic_id_invalid ·
+        #    Message thread not found 는 BadRequest 로 오므로 위 분기에서 잡힌다.
+        #    TimedOut·NetworkError 로 토픽을 지우면 네트워크가 흔들릴 때마다
+        #    멀쩡한 바인딩이 날아간다.
         logger.warning(
             f"Send to {chat_id} raised {type(e).__name__}; not retrying to "
             f"avoid a possible duplicate: {e}"

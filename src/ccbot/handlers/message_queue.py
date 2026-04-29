@@ -381,8 +381,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     link_preview_options=NO_LINK_PREVIEW,
                 )
                 await _send_task_images(bot, chat_id, task)
-                await asyncio.sleep(0.15)  # Wait for Claude TUI to update status
-                await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
                 raise
@@ -397,8 +395,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         link_preview_options=NO_LINK_PREVIEW,
                     )
                     await _send_task_images(bot, chat_id, task)
-                    await asyncio.sleep(0.15)  # Wait for Claude TUI to update status
-                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
                     raise
@@ -443,9 +439,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
 
-    # 5. After content, check and send status
-    await asyncio.sleep(0.15)  # Wait for Claude TUI to update status after response
-    await _check_and_send_status(bot, user_id, wid, task.thread_id)
+    # Status display is delegated to status_polling (1s interval) so the answer
+    # always remains the last visible message until polling detects working state.
 
 
 async def _convert_status_to_content(

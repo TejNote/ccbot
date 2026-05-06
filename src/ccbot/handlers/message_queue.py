@@ -461,6 +461,8 @@ async def _convert_status_to_content(
 
     msg_id, stored_wid, _ = info
     chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
+    # Clear persisted ID regardless of outcome — message is no longer a status message
+    session_manager.clear_status_msg_id(user_id, thread_id_or_0)
     if stored_wid != window_id:
         # Different window, just delete the old status
         try:

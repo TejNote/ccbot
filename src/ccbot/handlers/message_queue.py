@@ -381,8 +381,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     link_preview_options=NO_LINK_PREVIEW,
                 )
                 await _send_task_images(bot, chat_id, task)
-                await asyncio.sleep(0.15)  # Wait for Claude TUI to update status
-                await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
                 raise
@@ -397,8 +395,6 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         link_preview_options=NO_LINK_PREVIEW,
                     )
                     await _send_task_images(bot, chat_id, task)
-                    await asyncio.sleep(0.15)  # Wait for Claude TUI to update status
-                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
                     raise
@@ -443,9 +439,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     # 4. Send images if present (from tool_result with base64 image blocks)
     await _send_task_images(bot, chat_id, task)
 
-    # 5. After content, check and send status
-    await asyncio.sleep(0.15)  # Wait for Claude TUI to update status after response
-    await _check_and_send_status(bot, user_id, wid, task.thread_id)
+    # Status display is delegated to status_polling (1s interval) so the answer
+    # always remains the last visible message until polling detects working state.
 
 
 async def _convert_status_to_content(
@@ -466,6 +461,8 @@ async def _convert_status_to_content(
 
     msg_id, stored_wid, _ = info
     chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
+    # Clear persisted ID regardless of outcome — message is no longer a status message
+    session_manager.clear_status_msg_id(user_id, thread_id_or_0)
     if stored_wid != window_id:
         # Different window, just delete the old status
         try:
@@ -610,6 +607,9 @@ async def _do_send_status_message(
     )
     if sent:
         _status_msg_info[skey] = (sent.message_id, window_id, text)
+        session_manager.set_status_msg_id(
+            user_id, thread_id_or_0, sent.message_id, chat_id
+        )
 
 
 async def _do_clear_status_message(
@@ -627,6 +627,7 @@ async def _do_clear_status_message(
             await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
             logger.debug(f"Failed to delete status message {msg_id}: {e}")
+        session_manager.clear_status_msg_id(user_id, thread_id_or_0)
 
 
 async def _check_and_send_status(

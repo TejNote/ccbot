@@ -2034,6 +2034,15 @@ async def post_init(application: Application) -> None:
     bot_commands = _build_bot_commands()
     await application.bot.set_my_commands(bot_commands)
 
+    # Delete status messages left over from the previous run (orphaned on restart)
+    orphaned = session_manager.pop_all_status_msg_ids()
+    for msg_id, chat_id in orphaned:
+        try:
+            await application.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            logger.debug("Deleted orphaned status message %d", msg_id)
+        except Exception:
+            pass
+
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
 

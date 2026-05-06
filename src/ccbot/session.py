@@ -111,6 +111,9 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
+    # Persisted status message IDs for cleanup on restart.
+    # "user_id:thread_id" -> [msg_id, chat_id]
+    status_msg_ids: dict[str, list[int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -127,6 +130,7 @@ class SessionManager:
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
+            "status_msg_ids": self.status_msg_ids,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -160,6 +164,11 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
+                self.status_msg_ids = {
+                    k: v
+                    for k, v in state.get("status_msg_ids", {}).items()
+                    if isinstance(v, list) and len(v) == 2
+                }
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -191,6 +200,27 @@ class SessionManager:
                 self.window_display_names = {}
                 self.group_chat_ids = {}
                 pass
+
+    def set_status_msg_id(
+        self, user_id: int, thread_id: int, msg_id: int, chat_id: int
+    ) -> None:
+        key = f"{user_id}:{thread_id}"
+        self.status_msg_ids[key] = [msg_id, chat_id]
+        self._save_state()
+
+    def clear_status_msg_id(self, user_id: int, thread_id: int) -> None:
+        key = f"{user_id}:{thread_id}"
+        if key in self.status_msg_ids:
+            del self.status_msg_ids[key]
+            self._save_state()
+
+    def pop_all_status_msg_ids(self) -> list[tuple[int, int]]:
+        """Return and clear all persisted (msg_id, chat_id) pairs."""
+        items = [(v[0], v[1]) for v in self.status_msg_ids.values()]
+        self.status_msg_ids.clear()
+        if items:
+            self._save_state()
+        return items
 
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.

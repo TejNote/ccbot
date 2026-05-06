@@ -18,6 +18,12 @@ def main() -> None:
         hook_main()
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "send":
+        from .send import send_main
+
+        send_main()
+        return
+
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.WARNING,

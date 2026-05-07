@@ -2,7 +2,7 @@
 
 import pytest
 
-from ccbot.session import SessionManager
+from ccbot.session import SessionManager, WindowState
 
 
 @pytest.fixture
@@ -106,6 +106,38 @@ class TestWindowState:
         state.session_id = "abc"
         mgr.clear_window_session("@1")
         assert mgr.get_window_state("@1").session_id == ""
+
+
+class TestWindowStateProvider:
+    def test_default_provider_is_claude(self) -> None:
+        ws = WindowState(session_id="abc", cwd="/x", window_name="claude")
+        assert ws.provider == "claude"
+
+    def test_can_set_codex_provider(self) -> None:
+        ws = WindowState(provider="codex", cwd="/x", window_name="codex")
+        assert ws.provider == "codex"
+
+    def test_to_dict_includes_provider_only_when_codex(self) -> None:
+        codex_ws = WindowState(provider="codex", window_name="codex", cwd="/x")
+        assert codex_ws.to_dict()["provider"] == "codex"
+
+        claude_ws = WindowState(window_name="claude", cwd="/x")
+        assert "provider" not in claude_ws.to_dict()
+
+    def test_from_dict_legacy_state_defaults_to_claude(self) -> None:
+        legacy = {"session_id": "abc", "cwd": "/x", "window_name": "claude"}
+        ws = WindowState.from_dict(legacy)
+        assert ws.provider == "claude"
+
+    def test_from_dict_with_provider_codex(self) -> None:
+        new = {
+            "session_id": "",
+            "cwd": "/x",
+            "window_name": "codex",
+            "provider": "codex",
+        }
+        ws = WindowState.from_dict(new)
+        assert ws.provider == "codex"
 
 
 class TestResolveWindowForThread:

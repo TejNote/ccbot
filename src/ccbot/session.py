@@ -46,14 +46,20 @@ class WindowState:
     """Persistent state for a tmux window.
 
     Attributes:
-        session_id: Associated Claude session ID (empty if not yet detected)
+        session_id: Associated Claude session ID (empty if not yet detected,
+            or always empty for codex provider — codex windows are identified
+            by window_name, not UUID)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
+        provider: "claude" (default) or "codex". Determines which session
+            model the window holds. Only serialized when not the default
+            to keep state.json compact and backward-compatible.
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    provider: str = "claude"
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -62,6 +68,8 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.provider != "claude":
+            d["provider"] = self.provider
         return d
 
     @classmethod
@@ -70,6 +78,7 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            provider=data.get("provider", "claude"),
         )
 
 

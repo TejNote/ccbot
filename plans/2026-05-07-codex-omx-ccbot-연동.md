@@ -318,23 +318,30 @@ omx hooks status 2>&1 | head -20
 ```javascript
 // ~/Documents/Claude/.omx/hooks/ccbot-bridge.mjs
 //
-// omx hook plugin: turn-complete → tmux capture-pane → ccbot send --window
-// codex window의 한 턴이 끝나면 마지막 출력 일부를 Telegram 토픽으로 push.
+// omx hook plugin: turn-complete → tmux capture-pane → 마지막 turn 추출 → ccbot send
+// codex window의 한 턴이 끝나면 그 turn의 응답만 Telegram 토픽으로 push.
 //
-// 전제: 이 omx 인스턴스는 ccbot tmux session 안에서 실행 중이며,
-//       OMX_LAUNCH_POLICY=direct로 부팅됐다.
-//
-// 비활성: OMX_HOOK_PLUGINS=0 또는 파일 삭제
+// 전제: ccbot tmux session 안에서 OMX_LAUNCH_POLICY=direct로 부팅된 codex.
+// 비활성: OMX_HOOK_PLUGINS=0 또는 파일 삭제.
 
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g;
 const MAX_TG = 3500;       // Telegram 4096 - 마진
-const TAIL_LINES = 60;
+const TAIL_LINES = 200;    // 넓게 캡처. anchor로 자름
 const MIN_CONTENT_LINES = 2;
 
-function stripAnsi(s) {
-  return s.replace(ANSI_RE, "");
+// codex TUI 마커:
+// - 사용자 prompt 시작: `›`
+// - status bar (매 capture마다 바뀜): `gpt-{ver} {effort} · ...`
+const PROMPT_RE = /^\s*›\s/;
+const STATUS_BAR_RE = /^\s*gpt-[\d.]+(?:\s+\w+)?\s+·/;
+
+function stripAnsi(s) { return s.replace(ANSI_RE, ""); }
+
+function fingerprint(s) {
+  return createHash("sha256").update(s).digest("hex").slice(0, 16);
 }
 
 function capturePaneTail() {
@@ -347,9 +354,7 @@ function capturePaneTail() {
       { encoding: "utf8" },
     );
     return stripAnsi(raw).trimEnd();
-  } catch {
-    return "";
-  }
+  } catch { return ""; }
 }
 
 function tmuxWindowName() {
@@ -361,9 +366,25 @@ function tmuxWindowName() {
       ["display-message", "-p", "-t", pane, "#{window_name}"],
       { encoding: "utf8" },
     ).trim();
-  } catch {
-    return null;
+  } catch { return null; }
+}
+
+// codex 화면에서 "마지막 사용자 prompt + 그에 대한 응답"만 슬라이스.
+// 못 찾으면 마지막 30라인 fallback. status bar 라인은 잘라낸다.
+export function extractLastTurn(tail) {
+  const lines = tail.split("\n");
+
+  let promptIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (PROMPT_RE.test(lines[i])) { promptIdx = i; break; }
   }
+  if (promptIdx === -1) return lines.slice(-30).join("\n").trimEnd();
+
+  let endIdx = lines.length;
+  for (let i = lines.length - 1; i > promptIdx; i--) {
+    if (STATUS_BAR_RE.test(lines[i])) { endIdx = i; break; }
+  }
+  return lines.slice(promptIdx, endIdx).join("\n").trimEnd();
 }
 
 function ccbotSend(windowName, message) {
@@ -374,31 +395,35 @@ function ccbotSend(windowName, message) {
       stdio: "ignore",
       timeout: 10_000,
     });
-  } catch {
-    // best-effort: hook 실패가 omx 흐름을 막지 않는다
-  }
+  } catch { /* best-effort */ }
 }
 
 export async function onHookEvent(event, sdk) {
   if (event.event !== "turn-complete") return;
 
   const windowName = tmuxWindowName();
-  if (!windowName) {
-    await sdk.log.info?.("ccbot-bridge: no TMUX_PANE, skip");
-    return;
-  }
+  if (!windowName) { await sdk.log.info?.("ccbot-bridge: no TMUX_PANE, skip"); return; }
 
   const tail = capturePaneTail();
   if (!tail) return;
 
-  const lines = tail.split("\n").filter((l) => l.trim());
-  if (lines.length < MIN_CONTENT_LINES) return;
+  const turn = extractLastTurn(tail);
+  if (!turn) return;
+  if (turn.split("\n").filter((l) => l.trim()).length < MIN_CONTENT_LINES) return;
 
-  ccbotSend(windowName, `📟 [${windowName}]\n\`\`\`\n${tail}\n\`\`\``);
+  const fp = fingerprint(turn);
+  const stateKey = `last-fp:${windowName}`;
+  const lastFp = await sdk.state.read(stateKey);
+  if (fp === lastFp) {
+    await sdk.log.info?.("ccbot-bridge: duplicate turn, skip", { window: windowName });
+    return;
+  }
 
-  await sdk.log.info?.("ccbot-bridge: pushed to topic", {
-    window: windowName,
-    lines: lines.length,
+  ccbotSend(windowName, `📟 [${windowName}]\n\`\`\`\n${turn}\n\`\`\``);
+  await sdk.state.write(stateKey, fp);
+
+  await sdk.log.info?.("ccbot-bridge: pushed last turn", {
+    window: windowName, lines: turn.split("\n").length, fp,
   });
 }
 ```

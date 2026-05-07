@@ -308,32 +308,43 @@ omx hooks status 2>&1 | head -20
 
 - [ ] **Step 2: plugin 파일 작성**
 
+> SDK 형태 (실측 확인): `omx hooks init` scaffold + `dist/hooks/extensibility/types.d.ts:HookEventName` 기준.
+> - **export**: `export async function onHookEvent(event, sdk)` (default export 아님)
+> - **이벤트 분기**: `event.event === 'turn-complete'` 등. 사용 가능 이벤트:
+>   `'session-start' | 'stop' | 'session-end' | 'session-idle' | 'turn-complete' | 'blocked' | 'finished' | 'failed' | 'pre-tool-use' | 'post-tool-use' ...`
+> - **SDK**: `sdk.log.info(msg, payload?)`, `sdk.state.read(key)/write(key, value)` 가용.
+> - **TMUX_PANE**: plugin runner는 자식 프로세스라 부모 omx의 환경변수가 그대로 전달됨 → `process.env.TMUX_PANE` 사용 가능.
+
 ```javascript
 // ~/Documents/Claude/.omx/hooks/ccbot-bridge.mjs
 //
-// omx Stop hook → tmux capture-pane → ccbot send --window <name>
+// omx hook plugin: turn-complete → tmux capture-pane → ccbot send --window
 // codex window의 한 턴이 끝나면 마지막 출력 일부를 Telegram 토픽으로 push.
 //
 // 전제: 이 omx 인스턴스는 ccbot tmux session 안에서 실행 중이며,
 //       OMX_LAUNCH_POLICY=direct로 부팅됐다.
+//
+// 비활성: OMX_HOOK_PLUGINS=0 또는 파일 삭제
 
 import { execFileSync } from "node:child_process";
 
 const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g;
-const MAX_TG = 3500;          // Telegram 4096 - 마진
-const TAIL_LINES = 60;        // capture-pane에서 가져올 라인 수
+const MAX_TG = 3500;       // Telegram 4096 - 마진
+const TAIL_LINES = 60;
+const MIN_CONTENT_LINES = 2;
 
-function stripAnsi(s) { return s.replace(ANSI_RE, ""); }
+function stripAnsi(s) {
+  return s.replace(ANSI_RE, "");
+}
 
 function capturePaneTail() {
-  // TMUX_PANE은 omx가 떠있는 pane. pane id로 정확하게 캡처.
   const pane = process.env.TMUX_PANE;
   if (!pane) return "";
   try {
     const raw = execFileSync(
       "tmux",
       ["capture-pane", "-t", pane, "-p", "-S", `-${TAIL_LINES}`],
-      { encoding: "utf8" }
+      { encoding: "utf8" },
     );
     return stripAnsi(raw).trimEnd();
   } catch {
@@ -348,7 +359,7 @@ function tmuxWindowName() {
     return execFileSync(
       "tmux",
       ["display-message", "-p", "-t", pane, "#{window_name}"],
-      { encoding: "utf8" }
+      { encoding: "utf8" },
     ).trim();
   } catch {
     return null;
@@ -357,30 +368,39 @@ function tmuxWindowName() {
 
 function ccbotSend(windowName, message) {
   if (!windowName || !message) return;
-  let text = message.length > MAX_TG ? message.slice(-MAX_TG) : message;
+  const text = message.length > MAX_TG ? message.slice(-MAX_TG) : message;
   try {
     execFileSync("ccbot", ["send", "--window", windowName, text], {
       stdio: "ignore",
       timeout: 10_000,
     });
-  } catch (e) {
-    // hook은 실패해도 omx 흐름을 막지 않는다 — best effort
+  } catch {
+    // best-effort: hook 실패가 omx 흐름을 막지 않는다
   }
 }
 
-export default {
-  name: "ccbot-bridge",
-  events: ["Stop"],
-  async handle(_evt) {
-    const windowName = tmuxWindowName();
-    if (!windowName) return;
-    const tail = capturePaneTail();
-    if (!tail) return;
-    // 너무 짧은 출력(에코, 빈 프롬프트 등)은 noise — skip
-    if (tail.split("\n").filter((l) => l.trim()).length < 2) return;
-    ccbotSend(windowName, `📟 [${windowName}]\n\`\`\`\n${tail}\n\`\`\``);
-  },
-};
+export async function onHookEvent(event, sdk) {
+  if (event.event !== "turn-complete") return;
+
+  const windowName = tmuxWindowName();
+  if (!windowName) {
+    await sdk.log.info?.("ccbot-bridge: no TMUX_PANE, skip");
+    return;
+  }
+
+  const tail = capturePaneTail();
+  if (!tail) return;
+
+  const lines = tail.split("\n").filter((l) => l.trim());
+  if (lines.length < MIN_CONTENT_LINES) return;
+
+  ccbotSend(windowName, `📟 [${windowName}]\n\`\`\`\n${tail}\n\`\`\``);
+
+  await sdk.log.info?.("ccbot-bridge: pushed to topic", {
+    window: windowName,
+    lines: lines.length,
+  });
+}
 ```
 
 - [ ] **Step 3: omx hook validate**

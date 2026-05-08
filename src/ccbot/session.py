@@ -872,7 +872,21 @@ class SessionManager:
             if status and "esc to interrupt" in status.lower():
                 return False, "Claude가 응답 생성 중입니다. 완료 후 다시 시도해주세요."
 
-        success = await tmux_manager.send_keys(window.window_id, text)
+        # Per-provider input path:
+        # - claude: literal send-keys + Enter (existing behavior).
+        # - codex: paste-buffer + Enter. codex's multi-line composer treats
+        #   direct send-keys as newline accumulation and never fires submit.
+        #   paste-buffer sends the whole block as one bracketed-paste event
+        #   so Enter then submits.
+        # WindowState.provider is authoritative when set; otherwise fall back
+        # to display_name == "codex" so the bot Just Works after a restart
+        # cleared window_states (the codex window has no SessionStart hook
+        # to repopulate it, unlike claude --resume windows).
+        ws = self.window_states.get(window_id)
+        is_codex = (ws and ws.provider == "codex") or display == "codex"
+        success = await tmux_manager.send_keys(
+            window.window_id, text, use_paste=is_codex
+        )
         if success:
             return True, f"Sent to {display}"
         return False, "Failed to send keys"

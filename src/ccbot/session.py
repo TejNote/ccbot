@@ -62,10 +62,14 @@ class WindowState:
         d: dict[str, Any] = {
             "session_id": self.session_id,
             "cwd": self.cwd,
-            "provider": self.provider,
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        # provider는 기본값('claude')일 때 직렬화 생략 — 기존 state.json
+        # 모든 row에 'provider': 'claude' 가 강제 주입되는 걸 막아 backward-
+        # compat 보존. from_dict 가 누락 시 'claude' 로 복원하므로 안전.
+        if self.provider != "claude":
+            d["provider"] = self.provider
         return d
 
     @classmethod

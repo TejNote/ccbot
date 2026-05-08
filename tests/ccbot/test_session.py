@@ -174,6 +174,25 @@ class TestWindowProvider:
         assert restored.window_name == "codex"
         assert restored.session_id == "codex-thread-01"
 
+    def test_to_dict_omits_default_provider_for_backward_compat(self) -> None:
+        """default('claude')일 때 provider 키를 직렬화하지 않아 기존
+        state.json 모든 row 가 무수정으로 호환된다 (claude 브랜치 흡수)."""
+        from ccbot.session import WindowState
+
+        codex_ws = WindowState(provider="codex", window_name="codex", cwd="/x")
+        assert codex_ws.to_dict()["provider"] == "codex"
+
+        claude_ws = WindowState(window_name="claude", cwd="/x")
+        assert "provider" not in claude_ws.to_dict()
+
+    def test_from_dict_legacy_state_defaults_to_claude(self) -> None:
+        """provider 키 없는 기존 state.json 도 'claude' 로 복원 (claude 브랜치 흡수)."""
+        from ccbot.session import WindowState
+
+        legacy = {"session_id": "abc", "cwd": "/x", "window_name": "claude"}
+        ws = WindowState.from_dict(legacy)
+        assert ws.provider == "claude"
+
     def test_bind_thread_detects_codex_provider_from_window_name(
         self, mgr: SessionManager
     ) -> None:

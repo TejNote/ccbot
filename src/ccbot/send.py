@@ -55,8 +55,16 @@ def _resolve_routing(
             window_id = wid
             break
     if not window_id and window_name:
+        # window_display_names 는 ccbot 재기동 후에도 옛 window_id 가
+        # 잔존할 수 있다 (예: kickstart 로 codex 가 @27 → @6 으로 재 cut
+        # 됐는데 옛 @27 매핑이 남는 경우). 그 stale 항목을 잡으면
+        # thread_bindings 에서 못 찾아 silent fail. thread_bindings 에
+        # 실제 매핑된 window_id 만 fallback 후보로 삼는다 (claude 브랜치 흡수).
+        bound_window_ids: set[str] = set()
+        for bindings in state.get("thread_bindings", {}).values():
+            bound_window_ids.update(bindings.values())
         for wid, display_name in state.get("window_display_names", {}).items():
-            if display_name == window_name:
+            if display_name == window_name and wid in bound_window_ids:
                 window_id = wid
                 break
 

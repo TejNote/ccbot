@@ -24,7 +24,11 @@ from telegram import Bot
 from telegram.error import BadRequest
 
 from ..session import session_manager
-from ..terminal_parser import is_interactive_ui, parse_status_line
+from ..terminal_parser import (
+    is_interactive_ui,
+    parse_codex_status_line,
+    parse_status_line,
+)
 from ..tmux_manager import tmux_manager
 from .interactive_ui import (
     clear_interactive_msg,
@@ -106,7 +110,17 @@ async def update_status_message(
     if skip_status:
         return
 
-    status_line = parse_status_line(pane_text)
+    # provider 분기: codex window 는 별도 status 추출 함수.
+    # WindowState.provider 가 authoritative; 없으면 display_name == "codex" fallback
+    # (codex window 는 SessionStart hook 자동 등록 경로가 없어 window_states 가 빌 수 있음).
+    ws = session_manager.window_states.get(window_id)
+    display = session_manager.get_display_name(window_id)
+    is_codex = (ws is not None and ws.provider == "codex") or display == "codex"
+    status_line = (
+        parse_codex_status_line(pane_text)
+        if is_codex
+        else parse_status_line(pane_text)
+    )
 
     if status_line:
         await enqueue_status_update(

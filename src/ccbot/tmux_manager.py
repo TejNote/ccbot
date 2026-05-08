@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -223,8 +225,80 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_capture)
 
+    async def _send_via_paste(self, window_id: str, text: str) -> bool:
+        """Deliver text through tmux paste-buffer, then fire Enter.
+
+        Codex's composer handles bracketed paste more reliably than direct
+        send-keys for full Telegram messages. The trailing Enter submits after
+        the paste has been processed.
+        """
+
+        def _do_paste() -> bool:
+            session = self.get_session()
+            if not session:
+                logger.error("No tmux session found")
+                return False
+            try:
+                window = session.windows.get(window_id=window_id)
+                if not window:
+                    logger.error(f"Window {window_id} not found")
+                    return False
+                pane = window.active_pane
+                if not pane:
+                    logger.error(f"No active pane in window {window_id}")
+                    return False
+                target = pane.pane_id
+                if not target:
+                    logger.error(f"No active pane ID in window {window_id}")
+                    return False
+                buf_name = f"ccbot-{secrets.token_hex(4)}"
+                subprocess.run(
+                    ["tmux", "set-buffer", "-b", buf_name, "--", text],
+                    check=True,
+                    timeout=5,
+                )
+                subprocess.run(
+                    ["tmux", "paste-buffer", "-b", buf_name, "-t", target, "-d"],
+                    check=True,
+                    timeout=5,
+                )
+                return True
+            except subprocess.CalledProcessError as e:
+                logger.error(f"tmux paste failed for {window_id}: {e}")
+                return False
+            except Exception as e:
+                logger.error(f"Failed to paste to window {window_id}: {e}")
+                return False
+
+        def _send_enter() -> bool:
+            session = self.get_session()
+            if not session:
+                return False
+            try:
+                window = session.windows.get(window_id=window_id)
+                if not window:
+                    return False
+                pane = window.active_pane
+                if not pane:
+                    return False
+                pane.send_keys("", enter=True, literal=False)
+                return True
+            except Exception as e:
+                logger.error(f"Failed to fire Enter on {window_id}: {e}")
+                return False
+
+        if not await asyncio.to_thread(_do_paste):
+            return False
+        await asyncio.sleep(0.5)
+        return await asyncio.to_thread(_send_enter)
+
     async def send_keys(
-        self, window_id: str, text: str, enter: bool = True, literal: bool = True
+        self,
+        window_id: str,
+        text: str,
+        enter: bool = True,
+        literal: bool = True,
+        use_paste: bool = False,
     ) -> bool:
         """Send keys to a specific window.
 
@@ -234,10 +308,14 @@ class TmuxManager:
             enter: Whether to press enter after the text
             literal: If True, send text literally. If False, interpret special keys
                      like "Up", "Down", "Left", "Right", "Escape", "Enter".
+            use_paste: When True, route literal text through tmux paste-buffer.
 
         Returns:
             True if successful, False otherwise
         """
+        if literal and enter and use_paste:
+            return await self._send_via_paste(window_id, text)
+
         if literal and enter:
             # Split into text + delay + Enter via libtmux.
             # Claude Code's TUI sometimes interprets a rapid-fire Enter

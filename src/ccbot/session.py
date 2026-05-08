@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 import aiofiles
 
@@ -49,11 +49,14 @@ class WindowState:
         session_id: Associated Claude session ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
+        provider: Runtime provider for the window. ``claude`` uses JSONL/session
+            hook tracking; ``codex`` uses tmux send/capture only.
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    provider: Literal["claude", "codex"] = "claude"
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -62,6 +65,11 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        # provider는 기본값('claude')일 때 직렬화 생략 — 기존 state.json
+        # 모든 row에 'provider': 'claude' 가 강제 주입되는 걸 막아 backward-
+        # compat 보존. from_dict 가 누락 시 'claude' 로 복원하므로 안전.
+        if self.provider != "claude":
+            d["provider"] = self.provider
         return d
 
     @classmethod
@@ -70,6 +78,7 @@ class WindowState:
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            provider=data.get("provider", "claude"),
         )
 
 
@@ -442,8 +451,33 @@ class SessionManager:
         # Also update WindowState.window_name if it exists
         if window_id in self.window_states:
             self.window_states[window_id].window_name = new_name
+            self.window_states[window_id].provider = self.detect_window_provider(
+                new_name
+            )
         self._save_state()
         logger.info("Updated display name: window_id %s -> '%s'", window_id, new_name)
+
+    @staticmethod
+    def detect_window_provider(window_name: str) -> Literal["claude", "codex"]:
+        """Infer provider from a tmux window display name.
+
+        The first Codex integration is intentionally window-based. Users run
+        Codex/OMX direct in a named tmux window such as ``codex`` or
+        ``codex-api``; Claude remains the default for every other window.
+        """
+        name = window_name.strip().lower()
+        return "codex" if name == "codex" or name.startswith("codex-") else "claude"
+
+    def get_window_provider(self, window_id: str) -> Literal["claude", "codex"]:
+        """Return the provider for a tmux window, defaulting to Claude."""
+        return self.get_window_state(window_id).provider
+
+    def set_window_provider(
+        self, window_id: str, provider: Literal["claude", "codex"]
+    ) -> None:
+        """Persist the provider for a tmux window."""
+        self.get_window_state(window_id).provider = provider
+        self._save_state()
 
     # --- Group chat ID management (supergroup forum topic routing) ---
 
@@ -562,6 +596,9 @@ class SessionManager:
             if not new_sid:
                 continue
             state = self.get_window_state(window_id)
+            if state.provider != "claude":
+                state.provider = "claude"
+                changed = True
             if state.session_id != new_sid or state.cwd != new_cwd:
                 logger.info(
                     "Session map: window_id %s updated sid=%s, cwd=%s",
@@ -580,7 +617,18 @@ class SessionManager:
                     changed = True
 
         # Clean up window_states entries not in current session_map.
-        stale_wids = [w for w in self.window_states if w and w not in valid_wids]
+        stale_wids = []
+        for w, state in self.window_states.items():
+            if not w or w in valid_wids:
+                continue
+            display = state.window_name or self.window_display_names.get(w, "")
+            provider = state.provider
+            if display:
+                provider = self.detect_window_provider(display)
+                state.provider = provider
+                state.window_name = display
+            if provider == "claude":
+                stale_wids.append(w)
         for wid in stale_wids:
             logger.info("Removing stale window_state: %s", wid)
             del self.window_states[wid]
@@ -594,7 +642,11 @@ class SessionManager:
     def get_window_state(self, window_id: str) -> WindowState:
         """Get or create window state."""
         if window_id not in self.window_states:
-            self.window_states[window_id] = WindowState()
+            display = self.window_display_names.get(window_id, "")
+            self.window_states[window_id] = WindowState(
+                window_name=display,
+                provider=self.detect_window_provider(display) if display else "claude",
+            )
         return self.window_states[window_id]
 
     def clear_window_session(self, window_id: str) -> None:
@@ -766,8 +818,11 @@ class SessionManager:
         if user_id not in self.thread_bindings:
             self.thread_bindings[user_id] = {}
         self.thread_bindings[user_id][thread_id] = window_id
+        state = self.get_window_state(window_id)
         if window_name:
             self.window_display_names[window_id] = window_name
+            state.window_name = window_name
+            state.provider = self.detect_window_provider(window_name)
         self._save_state()
         display = window_name or self.get_display_name(window_id)
         logger.info(
@@ -855,15 +910,25 @@ class SessionManager:
         if not window:
             return False, "Window not found (may have been closed)"
 
-        # Check if Claude is currently generating a response.
-        # Claude TUI ignores key input while working, causing commands to be silently dropped.
-        pane_text = await tmux_manager.capture_pane(window.window_id)
-        if pane_text:
-            status = parse_status_line(pane_text)
-            if status and "esc to interrupt" in status.lower():
-                return False, "Claude가 응답 생성 중입니다. 완료 후 다시 시도해주세요."
+        if self.get_window_provider(window_id) == "claude":
+            # Check if Claude is currently generating a response.
+            # Claude TUI ignores key input while working, causing commands to be
+            # silently dropped. Codex windows are handled by raw tmux capture and
+            # currently skip this Claude-specific status parser.
+            pane_text = await tmux_manager.capture_pane(window.window_id)
+            if pane_text:
+                status = parse_status_line(pane_text)
+                if status and "esc to interrupt" in status.lower():
+                    return (
+                        False,
+                        "Claude가 응답 생성 중입니다. 완료 후 다시 시도해주세요.",
+                    )
 
-        success = await tmux_manager.send_keys(window.window_id, text)
+        success = await tmux_manager.send_keys(
+            window.window_id,
+            text,
+            use_paste=self.get_window_provider(window_id) == "codex",
+        )
         if success:
             return True, f"Sent to {display}"
         return False, "Failed to send keys"

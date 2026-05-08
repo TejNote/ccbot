@@ -197,7 +197,8 @@ def hook_main() -> None:
         try:
             ps_out = subprocess.run(
                 ["ps", "-o", "args=", "-p", str(os.getppid())],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
             cmdline = ps_out
         except Exception:

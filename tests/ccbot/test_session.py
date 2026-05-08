@@ -155,3 +155,71 @@ class TestIsWindowId:
         assert mgr._is_window_id("@") is False
         assert mgr._is_window_id("") is False
         assert mgr._is_window_id("@abc") is False
+
+
+class TestWindowProvider:
+    def test_window_state_round_trips_codex_provider(self) -> None:
+        from ccbot.session import WindowState
+
+        state = WindowState(
+            session_id="codex-thread-01",
+            cwd="/tmp/project",
+            window_name="codex",
+            provider="codex",
+        )
+
+        restored = WindowState.from_dict(state.to_dict())
+
+        assert restored.provider == "codex"
+        assert restored.window_name == "codex"
+        assert restored.session_id == "codex-thread-01"
+
+    def test_bind_thread_detects_codex_provider_from_window_name(
+        self, mgr: SessionManager
+    ) -> None:
+        mgr.bind_thread(100, 1, "@9", window_name="codex")
+
+        assert mgr.get_window_provider("@9") == "codex"
+
+    @pytest.mark.asyncio
+    async def test_load_session_map_preserves_codex_window_without_claude_session_map(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        session_map = tmp_path / "session_map.json"
+        session_map.write_text(
+            '{"ccbot:@1":{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",'
+            '"cwd":"/tmp/claude","window_name":"claude"}}'
+        )
+        monkeypatch.setattr("ccbot.session.config.session_map_file", session_map)
+        monkeypatch.setattr("ccbot.session.config.tmux_session_name", "ccbot")
+
+        mgr.bind_thread(100, 1, "@2", window_name="codex")
+        mgr.get_window_state("@2").session_id = "019e0198-7c94-7390-8b9a-a36a62b14747"
+        mgr.get_window_state("@2").cwd = "/tmp/codex"
+
+        await mgr.load_session_map()
+
+        assert "@2" in mgr.window_states
+        assert mgr.get_window_provider("@2") == "codex"
+
+    @pytest.mark.asyncio
+    async def test_load_session_map_preserves_codex_from_display_name_only(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        session_map = tmp_path / "session_map.json"
+        session_map.write_text(
+            '{"ccbot:@1":{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",'
+            '"cwd":"/tmp/claude","window_name":"claude"}}'
+        )
+        monkeypatch.setattr("ccbot.session.config.session_map_file", session_map)
+        monkeypatch.setattr("ccbot.session.config.tmux_session_name", "ccbot")
+
+        mgr.thread_bindings[100] = {1: "@2"}
+        mgr.window_display_names["@2"] = "codex"
+        mgr.get_window_state("@2")
+
+        await mgr.load_session_map()
+
+        assert "@2" in mgr.window_states
+        assert mgr.get_window_state("@2").window_name == "codex"
+        assert mgr.get_window_provider("@2") == "codex"

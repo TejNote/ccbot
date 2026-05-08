@@ -21,7 +21,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from telegram import Bot
 from telegram.constants import ChatAction
@@ -123,12 +123,14 @@ def get_or_create_queue(
     return _message_queues[user_id]
 
 
-def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
+def _inspect_queue(
+    queue: asyncio.Queue[MessageTask | DirectMessage],
+) -> list[MessageTask | DirectMessage]:
     """Non-destructively inspect all items in queue.
 
     Drains the queue and returns all items. Caller must refill.
     """
-    items: list[MessageTask] = []
+    items: list[MessageTask | DirectMessage] = []
     while not queue.empty():
         try:
             item = queue.get_nowait()
@@ -155,7 +157,7 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
 
 
 async def _merge_content_tasks(
-    queue: asyncio.Queue[MessageTask],
+    queue: asyncio.Queue[MessageTask | DirectMessage],
     first: MessageTask,
     lock: asyncio.Lock,
 ) -> tuple[MessageTask, int]:
@@ -176,9 +178,12 @@ async def _merge_content_tasks(
 
     async with lock:
         items = _inspect_queue(queue)
-        remaining: list[MessageTask] = []
+        remaining: list[MessageTask | DirectMessage] = []
 
         for i, task in enumerate(items):
+            if not isinstance(task, MessageTask):
+                remaining = items[i:]
+                break
             if not _can_merge_tasks(first, task):
                 # Can't merge, keep this and all remaining items
                 remaining = items[i:]
@@ -299,7 +304,7 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
             logger.error(f"Unexpected error in queue worker for user {user_id}: {e}")
 
 
-def _send_kwargs(thread_id: int | None) -> dict[str, int]:
+def _send_kwargs(thread_id: int | None) -> dict[str, Any]:
     """Build message_thread_id kwargs for bot.send_message()."""
     if thread_id is not None:
         return {"message_thread_id": thread_id}

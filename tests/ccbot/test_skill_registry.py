@@ -123,7 +123,10 @@ class TestCommandConversion:
         reg = SkillRegistry(plugins_dir, tmp_path / "state.json")
         reg.scan()
 
-        assert reg.get_slash_command("superpowers_systematic_debugging") == "/superpowers:systematic-debugging"
+        assert (
+            reg.get_slash_command("superpowers_systematic_debugging")
+            == "/superpowers:systematic-debugging"
+        )
 
 
 class TestNameCollision:

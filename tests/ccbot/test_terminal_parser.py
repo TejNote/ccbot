@@ -101,6 +101,27 @@ class TestExtractInteractiveContent:
         assert result.name == "PermissionPrompt"
         assert "Do you want to proceed?" in result.content
 
+    def test_codex_command_permission_prompt(self):
+        pane = (
+            "  Would you like to run the following command?\n"
+            "\n"
+            "  Reason: Telegram 메시지 수신 여부를 확인합니다.\n"
+            "\n"
+            "  $ printf '%s\\n' '--- process ---'\n"
+            "\n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. No, and tell Codex what to do differently (esc)\n"
+            "\n"
+            "  Press enter to confirm or esc to cancel\n"
+        )
+
+        result = extract_interactive_content(pane)
+
+        assert result is not None
+        assert result.name == "PermissionPrompt"
+        assert "Would you like to run the following command?" in result.content
+        assert "Press enter to confirm or esc to cancel" in result.content
+
     def test_restore_checkpoint(self):
         pane = (
             "  Restore the code to a previous state?\n"
@@ -263,3 +284,94 @@ class TestExtractBashOutput:
         result = extract_bash_output(pane, "echo hi")
         assert result is not None
         assert not result.endswith("\n")
+
+
+class TestPaneSnapshotFormatting:
+    def test_strip_ansi_control_sequences(self):
+        from ccbot.terminal_parser import strip_ansi_control_sequences
+
+        assert strip_ansi_control_sequences("\x1b[31mred\x1b[0m\r\n") == "red\n"
+
+    def test_format_pane_snapshot_strips_chrome_and_limits_blank_lines(self):
+        from ccbot.terminal_parser import format_pane_snapshot
+
+        pane = (
+            "\x1b[32mAnswer line\x1b[0m\n"
+            "\n"
+            "\n"
+            "More detail\n"
+            "──────────────────────────────────────\n"
+            "❯ prompt\n"
+            "──────────────────────────────────────\n"
+            "model · context\n"
+        )
+
+        assert format_pane_snapshot(pane) == "Answer line\n\nMore detail"
+
+
+class TestParseCodexStatusLine:
+    """Codex provider thinking/tool status extraction."""
+
+    def test_working_line_returns_thinking_status(self) -> None:
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› 5초 기다린 후 README 출력\n"
+            "• Working (3s • esc to interrupt)\n"
+            "  gpt-5.5 high · 5h 99% · weekly 73% · Context 94% left · main\n"
+        )
+
+        result = parse_codex_status_line(pane)
+
+        assert result is not None
+        assert result.startswith("⏳")
+        assert "Working" in result
+        assert "(3s" in result
+
+    def test_tool_use_line_returns_tool_status(self) -> None:
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› LICENSE 보여줘\n"
+            "• Read LICENSE\n"
+            "  gpt-5.5 high · 5h 99% · weekly 73% · Context 94% left · main\n"
+        )
+
+        result = parse_codex_status_line(pane)
+
+        assert result is not None
+        assert result.startswith("🔧")
+        assert "Read" in result
+
+    def test_response_text_returns_none(self) -> None:
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = "› 안녕\n• 안녕하세요! 무엇을 도와드릴까요?\n  gpt-5.5 high · main\n"
+
+        assert parse_codex_status_line(pane) is None
+
+    def test_hook_meta_lines_filtered(self) -> None:
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› 안녕\n"
+            "• SessionStart hook (completed)\n"
+            "• UserPromptSubmit hook (completed)\n"
+            "• Working (1s • esc to interrupt)\n"
+            "  gpt-5.5 high · main\n"
+        )
+
+        result = parse_codex_status_line(pane)
+
+        assert result is not None
+        assert "Working" in result
+
+    def test_idle_returns_none(self) -> None:
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        assert parse_codex_status_line("") is None
+        assert parse_codex_status_line("\n\n\n") is None
+        assert (
+            parse_codex_status_line("› Implement {feature}\n  gpt-5.5 high · main\n")
+            is None
+        )

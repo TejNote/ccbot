@@ -130,7 +130,7 @@ class SkillRegistry:
                         # e.g. "octo-km" → "km", "octo" stays "octo"
                         prefix = plugin_name + "-"
                         if file_stem.startswith(prefix):
-                            cmd_name = file_stem[len(prefix):]
+                            cmd_name = file_stem[len(prefix) :]
                         elif file_stem == plugin_name:
                             cmd_name = plugin_name
                         else:

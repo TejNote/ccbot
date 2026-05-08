@@ -78,13 +78,17 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Do you want to make this edit"),
             re.compile(r"^\s*Do you want to create \S"),
             re.compile(r"^\s*Do you want to delete \S"),
+            re.compile(r"^\s*Would you like to run the following command\?"),
         ),
-        bottom=(re.compile(r"^\s*Esc to cancel"),),
+        bottom=(
+            re.compile(r"^\s*Esc to cancel"),
+            re.compile(r"(?i)esc to cancel"),
+        ),
     ),
     UIPattern(
         # Permission menu with numbered choices (no "Esc to cancel" line)
         name="PermissionPrompt",
-        top=(re.compile(r"^\s*❯\s*1\.\s*Yes"),),
+        top=(re.compile(r"^\s*[❯›]\s*1\.\s*Yes"),),
         bottom=(),
         min_gap=2,
     ),
@@ -198,6 +202,64 @@ def is_interactive_ui(pane_text: str) -> bool:
 # Spinner characters Claude Code uses in its status line
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
 
+# ── codex status line patterns ─────────────────────────────────────────
+#
+# Claude status uses a spinner line near the bottom chrome. Codex TUI exposes
+# progress as text lines such as `• Working (3s • esc to interrupt)` and tool
+# lines such as `• Ran ...`. We only surface these status/tool lines; regular
+# response text must not become a status update.
+
+CODEX_THINKING_RE = re.compile(r"^\s*•\s+Working\s+\(\d+s\b")
+CODEX_TOOL_VERBS = (
+    "Ran",
+    "Read",
+    "Edit",
+    "Wrote",
+    "Explored",
+    "Searched",
+    "Bash",
+    "Code",
+    "Patch",
+    "Diff",
+)
+CODEX_TOOL_RE = re.compile(rf"^\s*•\s+(?:{'|'.join(CODEX_TOOL_VERBS)})\b")
+CODEX_HOOK_RE = re.compile(
+    r"^\s*•\s+(?:SessionStart|UserPromptSubmit|PreToolUse|PostToolUse|Stop)\s+hook\b"
+)
+CODEX_STATUS_BAR_RE = re.compile(r"^\s*gpt-[\d.]+(?:\s+\w+)?\s+·")
+CODEX_TOOL_LINE_MAX = 100
+
+
+def parse_codex_status_line(pane_text: str) -> str | None:
+    """Extract Codex thinking/tool status from a captured pane.
+
+    Returns a short status for in-place Telegram status updates, or None for
+    idle/regular response text. Final Codex replies are expected to be pushed by
+    the external OMX/codex hook bridge, not by pane snapshots.
+    """
+    if not pane_text:
+        return None
+
+    lines = pane_text.split("\n")
+    last_tool: str | None = None
+
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if CODEX_STATUS_BAR_RE.match(line):
+            continue
+        if CODEX_HOOK_RE.match(line):
+            continue
+        if CODEX_THINKING_RE.match(line):
+            return f"⏳ {stripped[:CODEX_TOOL_LINE_MAX]}"
+        if last_tool is None and CODEX_TOOL_RE.match(line):
+            last_tool = stripped[:CODEX_TOOL_LINE_MAX]
+
+    if last_tool is not None:
+        return f"🔧 {last_tool}"
+    return None
+
 
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
@@ -261,6 +323,46 @@ def strip_pane_chrome(lines: list[str]) -> list[str]:
         if len(stripped) >= 20 and all(c == "─" for c in stripped):
             return lines[:i]
     return lines
+
+
+ANSI_CONTROL_RE = re.compile(
+    r"(?:\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-_])"
+)
+
+
+def strip_ansi_control_sequences(text: str) -> str:
+    """Remove ANSI escape/control sequences from captured terminal text."""
+    text = ANSI_CONTROL_RE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Keep normal newlines/tabs; remove other C0 controls that Telegram may show.
+    return "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+
+
+def format_pane_snapshot(pane_text: str) -> str:
+    """Return a Telegram-friendly snapshot from captured tmux pane text.
+
+    The first Codex bridge intentionally uses terminal capture instead of Codex
+    rollout JSONL. This helper keeps that output readable by stripping ANSI
+    sequences, removing known bottom chrome, and collapsing excessive blank
+    lines without truncating content at the parser layer.
+    """
+    cleaned = strip_ansi_control_sequences(pane_text)
+    lines = strip_pane_chrome(cleaned.splitlines())
+
+    compact: list[str] = []
+    blank_seen = False
+    for line in lines:
+        if line.strip():
+            compact.append(line.rstrip())
+            blank_seen = False
+        elif not blank_seen and compact:
+            compact.append("")
+            blank_seen = True
+
+    while compact and not compact[-1].strip():
+        compact.pop()
+
+    return "\n".join(compact).strip()
 
 
 def extract_bash_output(pane_text: str, command: str) -> str | None:

@@ -198,6 +198,78 @@ def is_interactive_ui(pane_text: str) -> bool:
 # Spinner characters Claude Code uses in its status line
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
 
+# ── codex status line patterns (실측 fixture: tests/ccbot/fixtures/codex_thinking_trace.txt) ──
+#
+# claude 와 다르게 codex 의 thinking 표시는 spinner character 한 글자가 아니라
+# 텍스트 패턴 `• Working (Xs • esc to interrupt) [· bg info ...]` 형태로 그려진다.
+# 도구 사용 라인은 `• <Verb> ...` 구조이고, hook 메타 라인 (`• SessionStart hook
+# (completed)` 등) 은 사용자 노출 대상이 아니므로 제외한다.
+
+# `• Working (Xs ...)`  — codex 의 thinking 카운터 라인
+CODEX_THINKING_RE = re.compile(r"^\s*•\s+Working\s+\(\d+s\b")
+
+# `• Ran ...`, `• Read ...` 등 도구 사용 verb 화이트리스트
+CODEX_TOOL_VERBS = (
+    "Ran",
+    "Read",
+    "Edit",
+    "Wrote",
+    "Explored",
+    "Searched",
+    "Bash",
+    "Code",
+    "Patch",
+    "Diff",
+)
+CODEX_TOOL_RE = re.compile(rf"^\s*•\s+(?:{'|'.join(CODEX_TOOL_VERBS)})\b")
+
+# omx / codex 가 자체 hook 완료를 화면에 출력하는 메타 라인 — 사용자 노출 X
+CODEX_HOOK_RE = re.compile(
+    r"^\s*•\s+(?:SessionStart|UserPromptSubmit|PreToolUse|PostToolUse|Stop)\s+hook\b"
+)
+
+# codex 화면 하단 status bar (`gpt-5.5 high · 5h 99% · main`)
+CODEX_STATUS_BAR_RE = re.compile(r"^\s*gpt-[\d.]+(?:\s+\w+)?\s+·")
+
+# status 메시지에 포함할 라인 길이 상한 (telegram 가독성)
+CODEX_TOOL_LINE_MAX = 100
+
+
+def parse_codex_status_line(pane_text: str) -> str | None:
+    """Extract codex thinking/tool status from a captured pane.
+
+    Priorities (claude 의 ``parse_status_line`` 과 대칭 구조):
+      1) ``• Working (Xs • esc to interrupt)`` 라인  → ``"⏳ Working (Xs)"``
+      2) 가장 최근 ``• <Verb> ...`` 도구 사용 라인     → ``"🔧 <line>"``
+      3) hook 메타 / status bar / 일반 응답 텍스트는 모두 무시 → ``None`` (idle)
+
+    capture-pane 결과를 마지막 라인부터 역순으로 스캔해서 첫 매칭만 사용.
+    응답 본문 (``• 안녕하세요...``) 은 어느 패턴에도 매칭하지 않으므로 None
+    이 되어 polling loop 가 status 메시지를 정리하도록 둔다.
+    """
+    if not pane_text:
+        return None
+
+    lines = pane_text.split("\n")
+    last_tool: str | None = None
+
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if CODEX_STATUS_BAR_RE.match(line):
+            continue
+        if CODEX_HOOK_RE.match(line):
+            continue
+        if CODEX_THINKING_RE.match(line):
+            return f"⏳ {stripped[:CODEX_TOOL_LINE_MAX]}"
+        if last_tool is None and CODEX_TOOL_RE.match(line):
+            last_tool = stripped[:CODEX_TOOL_LINE_MAX]
+
+    if last_tool is not None:
+        return f"🔧 {last_tool}"
+    return None
+
 
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.

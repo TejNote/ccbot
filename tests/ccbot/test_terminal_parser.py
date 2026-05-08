@@ -263,3 +263,118 @@ class TestExtractBashOutput:
         result = extract_bash_output(pane, "echo hi")
         assert result is not None
         assert not result.endswith("\n")
+
+
+class TestParseCodexStatusLine:
+    """codex provider 의 thinking/tool status 추출 — 실측 fixture 기반."""
+
+    def test_working_line_returns_thinking_status(self) -> None:
+        """• Working (Xs ...) 라인이 있으면 ⏳ prefix 로 반환."""
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› 5초 기다린 후 README 출력\n"
+            "• Working (3s • esc to interrupt)\n"
+            "  gpt-5.5 high · 5h 99% · weekly 73% · Context 94% left · main\n"
+        )
+        result = parse_codex_status_line(pane)
+        assert result is not None
+        assert result.startswith("⏳")
+        assert "Working" in result
+        assert "(3s" in result
+
+    def test_working_line_with_bg_info_preserved(self) -> None:
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› 작업\n"
+            "• Working (12s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close\n"
+            "  gpt-5.5 high · main\n"
+        )
+        result = parse_codex_status_line(pane)
+        assert result is not None
+        assert "Working" in result
+        assert "background terminal" in result
+
+    def test_tool_use_line_returns_tool_status(self) -> None:
+        """thinking 없을 때 가장 최근 • <Verb> 도구 사용 라인 반환."""
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› LICENSE 보여줘\n"
+            "• Read LICENSE\n"
+            "  gpt-5.5 high · 5h 99% · weekly 73% · Context 94% left · main\n"
+        )
+        result = parse_codex_status_line(pane)
+        assert result is not None
+        assert result.startswith("🔧")
+        assert "Read" in result
+
+    def test_thinking_takes_priority_over_tool(self) -> None:
+        """Working 라인이 있으면 그게 우선, 도구 라인은 무시."""
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› 작업\n"
+            "• Ran sleep 5\n"
+            "• Working (5s • esc to interrupt)\n"
+            "  gpt-5.5 high · main\n"
+        )
+        result = parse_codex_status_line(pane)
+        assert result is not None
+        assert result.startswith("⏳")
+        assert "Working" in result
+
+    def test_idle_returns_none(self) -> None:
+        """status bar + placeholder만 있으면 None."""
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› Implement {feature}\n"
+            "  gpt-5.5 high · 5h 99% · weekly 73% · Context 94% left · main\n"
+        )
+        assert parse_codex_status_line(pane) is None
+
+    def test_response_text_returns_none(self) -> None:
+        """일반 응답 본문(• 안녕하세요...)은 thinking/tool 패턴에 매칭 안 됨 → None."""
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› 안녕\n"
+            "• 안녕하세요! 무엇을 도와드릴까요?\n"
+            "  gpt-5.5 high · main\n"
+        )
+        assert parse_codex_status_line(pane) is None
+
+    def test_hook_meta_lines_filtered(self) -> None:
+        """• SessionStart hook (completed) 같은 메타 라인은 무시."""
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "› 안녕\n"
+            "• SessionStart hook (completed)\n"
+            "• UserPromptSubmit hook (completed)\n"
+            "• Working (1s • esc to interrupt)\n"
+            "  gpt-5.5 high · main\n"
+        )
+        result = parse_codex_status_line(pane)
+        assert result is not None
+        assert "Working" in result
+
+    def test_empty_pane_returns_none(self) -> None:
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        assert parse_codex_status_line("") is None
+        assert parse_codex_status_line("\n\n\n") is None
+
+    def test_status_bar_filtered_from_result(self) -> None:
+        """status bar 자체는 결과에 포함되지 않는다."""
+        from ccbot.terminal_parser import parse_codex_status_line
+
+        pane = (
+            "• Ran echo hello\n"
+            "  gpt-5.5 high · 5h 99% · weekly 73% · Context 94% left · main\n"
+        )
+        result = parse_codex_status_line(pane)
+        assert result is not None
+        assert "gpt-5.5" not in result

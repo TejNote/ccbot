@@ -69,9 +69,18 @@ def _resolve_routing(
     # window_display_names에는 매핑이 살아있다. 특히 codex provider는
     # session_monitor의 jsonl-기반 등록 경로가 없으므로 이 fallback이
     # 일반 동작 경로다 (claude도 첫 메시지 직전엔 동일 상태).
+    #
+    # window_display_names 는 ccbot 재기동 후에도 옛날 window_id 가 잔존할
+    # 수 있다 (예: kickstart 로 codex 가 @27 → @6 으로 재 cut 됐는데 옛
+    # @27 매핑이 남는 경우). 그 stale 항목을 잡으면 thread_bindings 에서
+    # 못 찾아 silent fail. 따라서 thread_bindings 에 실제 매핑이 있는
+    # window_id 만 후보로 삼는다.
     if not window_id and window_name:
+        bound_window_ids: set[str] = set()
+        for bindings in state.get("thread_bindings", {}).values():
+            bound_window_ids.update(bindings.values())
         for wid, name in state.get("window_display_names", {}).items():
-            if name == window_name:
+            if name == window_name and wid in bound_window_ids:
                 window_id = wid
                 break
 

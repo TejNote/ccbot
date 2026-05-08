@@ -225,15 +225,13 @@ class TmuxManager:
 
         return await asyncio.to_thread(_sync_capture)
 
-    async def _send_via_paste(
-        self, window_id: str, text: str, submit_key: str = "Enter"
-    ) -> bool:
-        """Deliver ``text`` through tmux paste-buffer, then fire ``submit_key``.
+    async def _send_via_paste(self, window_id: str, text: str) -> bool:
+        """Deliver ``text`` through tmux paste-buffer, then fire Enter.
 
         Required for codex's multi-line composer where direct send-keys input
         is treated as newline accumulation instead of submit. paste-buffer
-        sends the whole block as a single bracketed-paste event and a
-        following Enter is then interpreted as submit.
+        sends the whole block as a single bracketed-paste event; the trailing
+        Enter is then interpreted as submit.
 
         Uses a per-call buffer name so concurrent calls never collide. The
         buffer is auto-deleted via ``paste-buffer -d``.
@@ -275,7 +273,7 @@ class TmuxManager:
                 logger.error(f"Failed to paste to window {window_id}: {e}")
                 return False
 
-        def _send_submit() -> bool:
+        def _send_enter() -> bool:
             session = self.get_session()
             if not session:
                 return False
@@ -286,22 +284,17 @@ class TmuxManager:
                 pane = window.active_pane
                 if not pane:
                     return False
-                if submit_key == "Enter":
-                    pane.send_keys("", enter=True, literal=False)
-                else:
-                    pane.send_keys(submit_key, enter=False, literal=False)
+                pane.send_keys("", enter=True, literal=False)
                 return True
             except Exception as e:
-                logger.error(
-                    f"Failed to fire submit_key {submit_key!r} on {window_id}: {e}"
-                )
+                logger.error(f"Failed to fire Enter on {window_id}: {e}")
                 return False
 
         if not await asyncio.to_thread(_do_paste):
             return False
         # 500ms gap so the TUI processes the paste event before submit fires.
         await asyncio.sleep(0.5)
-        return await asyncio.to_thread(_send_submit)
+        return await asyncio.to_thread(_send_enter)
 
     async def send_keys(
         self,
@@ -309,7 +302,6 @@ class TmuxManager:
         text: str,
         enter: bool = True,
         literal: bool = True,
-        submit_key: str = "Enter",
         use_paste: bool = False,
     ) -> bool:
         """Send keys to a specific window.
@@ -320,22 +312,18 @@ class TmuxManager:
             enter: Whether to press enter after the text
             literal: If True, send text literally. If False, interpret special keys
                      like "Up", "Down", "Left", "Right", "Escape", "Enter".
-            submit_key: Tmux key name to fire after the text (when ``enter`` is True).
-                Most TUIs accept ``"Enter"``. Codex's TUI treats ``Enter`` / ``C-m``
-                as newline; for the codex multi-line composer use ``use_paste=True``
-                instead — Enter then submits the pasted block.
             use_paste: When True, route the text through tmux ``set-buffer`` /
                 ``paste-buffer`` instead of literal send-keys. Required for the
                 codex composer, which accumulates direct send-keys input as
                 additional newlines and never fires submit. With paste, the text
-                is delivered as one bracketed-paste event and the trailing
-                ``submit_key`` (Enter) is interpreted as submit.
+                is delivered as one bracketed-paste event and the trailing Enter
+                is interpreted as submit.
 
         Returns:
             True if successful, False otherwise
         """
         if literal and enter and use_paste:
-            return await self._send_via_paste(window_id, text, submit_key)
+            return await self._send_via_paste(window_id, text)
         if literal and enter:
             # Split into text + delay + Enter via libtmux.
             # Claude Code's TUI sometimes interprets a rapid-fire Enter
@@ -373,18 +361,10 @@ class TmuxManager:
                     pane = window.active_pane
                     if not pane:
                         return False
-                    if submit_key == "Enter":
-                        # Default — libtmux's enter=True fires Enter via tmux.
-                        pane.send_keys("", enter=True, literal=False)
-                    else:
-                        # Named tmux key (e.g. "C-j" for codex). Don't tack
-                        # an additional Enter on top.
-                        pane.send_keys(submit_key, enter=False, literal=False)
+                    pane.send_keys("", enter=True, literal=False)
                     return True
                 except Exception as e:
-                    logger.error(
-                        f"Failed to send submit key {submit_key!r} to window {window_id}: {e}"
-                    )
+                    logger.error(f"Failed to send Enter to window {window_id}: {e}")
                     return False
 
             # Claude Code's ! command mode: send "!" first so the TUI

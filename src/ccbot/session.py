@@ -883,7 +883,7 @@ class SessionManager:
         # cleared window_states (the codex window has no SessionStart hook
         # to repopulate it, unlike claude --resume windows).
         ws = self.window_states.get(window_id)
-        is_codex = (ws and ws.provider == "codex") or display == "codex"
+        is_codex = (ws is not None and ws.provider == "codex") or display == "codex"
         success = await tmux_manager.send_keys(
             window.window_id, text, use_paste=is_codex
         )

@@ -316,116 +316,45 @@ omx hooks status 2>&1 | head -20
 > - **TMUX_PANE**: plugin runner는 자식 프로세스라 부모 omx의 환경변수가 그대로 전달됨 → `process.env.TMUX_PANE` 사용 가능.
 
 ```javascript
-// ~/Documents/Claude/.omx/hooks/ccbot-bridge.mjs
+// 본문 정합 reference: ~/Documents/Claude/.omx/hooks/ccbot-bridge.mjs
+// (전체 코드는 위 hook 파일 직접 참조 — plan 길이 부담 줄이기 위해 핵심 골격만 발췌)
 //
-// omx hook plugin: turn-complete → tmux capture-pane → 마지막 turn 추출 → ccbot send
-// codex window의 한 턴이 끝나면 그 turn의 응답만 Telegram 토픽으로 push.
+// 기본 골격:
+//   import { execFileSync } from "node:child_process";
+//   import { createHash } from "node:crypto";
 //
-// 전제: ccbot tmux session 안에서 OMX_LAUNCH_POLICY=direct로 부팅된 codex.
-// 비활성: OMX_HOOK_PLUGINS=0 또는 파일 삭제.
-
-import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-
-const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g;
-const MAX_TG = 3500;       // Telegram 4096 - 마진
-const TAIL_LINES = 200;    // 넓게 캡처. anchor로 자름
-const MIN_CONTENT_LINES = 2;
-
-// codex TUI 마커:
-// - 사용자 prompt 시작: `›`
-// - status bar (매 capture마다 바뀜): `gpt-{ver} {effort} · ...`
-const PROMPT_RE = /^\s*›\s/;
-const STATUS_BAR_RE = /^\s*gpt-[\d.]+(?:\s+\w+)?\s+·/;
-
-function stripAnsi(s) { return s.replace(ANSI_RE, ""); }
-
-function fingerprint(s) {
-  return createHash("sha256").update(s).digest("hex").slice(0, 16);
-}
-
-function capturePaneTail() {
-  const pane = process.env.TMUX_PANE;
-  if (!pane) return "";
-  try {
-    const raw = execFileSync(
-      "tmux",
-      ["capture-pane", "-t", pane, "-p", "-S", `-${TAIL_LINES}`],
-      { encoding: "utf8" },
-    );
-    return stripAnsi(raw).trimEnd();
-  } catch { return ""; }
-}
-
-function tmuxWindowName() {
-  const pane = process.env.TMUX_PANE;
-  if (!pane) return null;
-  try {
-    return execFileSync(
-      "tmux",
-      ["display-message", "-p", "-t", pane, "#{window_name}"],
-      { encoding: "utf8" },
-    ).trim();
-  } catch { return null; }
-}
-
-// codex 화면에서 "마지막 사용자 prompt + 그에 대한 응답"만 슬라이스.
-// 못 찾으면 마지막 30라인 fallback. status bar 라인은 잘라낸다.
-export function extractLastTurn(tail) {
-  const lines = tail.split("\n");
-
-  let promptIdx = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (PROMPT_RE.test(lines[i])) { promptIdx = i; break; }
-  }
-  if (promptIdx === -1) return lines.slice(-30).join("\n").trimEnd();
-
-  let endIdx = lines.length;
-  for (let i = lines.length - 1; i > promptIdx; i--) {
-    if (STATUS_BAR_RE.test(lines[i])) { endIdx = i; break; }
-  }
-  return lines.slice(promptIdx, endIdx).join("\n").trimEnd();
-}
-
-function ccbotSend(windowName, message) {
-  if (!windowName || !message) return;
-  const text = message.length > MAX_TG ? message.slice(-MAX_TG) : message;
-  try {
-    execFileSync("ccbot", ["send", "--window", windowName, text], {
-      stdio: "ignore",
-      timeout: 10_000,
-    });
-  } catch { /* best-effort */ }
-}
-
-export async function onHookEvent(event, sdk) {
-  if (event.event !== "turn-complete") return;
-
-  const windowName = tmuxWindowName();
-  if (!windowName) { await sdk.log.info?.("ccbot-bridge: no TMUX_PANE, skip"); return; }
-
-  const tail = capturePaneTail();
-  if (!tail) return;
-
-  const turn = extractLastTurn(tail);
-  if (!turn) return;
-  if (turn.split("\n").filter((l) => l.trim()).length < MIN_CONTENT_LINES) return;
-
-  const fp = fingerprint(turn);
-  const stateKey = `last-fp:${windowName}`;
-  const lastFp = await sdk.state.read(stateKey);
-  if (fp === lastFp) {
-    await sdk.log.info?.("ccbot-bridge: duplicate turn, skip", { window: windowName });
-    return;
-  }
-
-  ccbotSend(windowName, `📟 [${windowName}]\n\`\`\`\n${turn}\n\`\`\``);
-  await sdk.state.write(stateKey, fp);
-
-  await sdk.log.info?.("ccbot-bridge: pushed last turn", {
-    window: windowName, lines: turn.split("\n").length, fp,
-  });
-}
+//   const PROMPT_RE     = /^\s*›\s/;
+//   const RESPONSE_RE   = /^\s*•\s/;
+//   const STATUS_BAR_RE = /^\s*gpt-[\d.]+(?:\s+\w+)?\s+·/;
+//   const SEPARATOR_RE  = /^\s*[─━]{20,}\s*$/;
+//   const CCBOT_BIN     = "/Users/pakjungeol/.local/bin/ccbot";  // PATH 의존 회피
+//
+//   export function extractLastTurn(tail) {
+//     // 1) 마지막 `•` 응답 라인을 anchor (lastResponseIdx)
+//     // 2) startIdx = 직전 `›` 다음의 첫 `•` (사용자 입력 라인 제외)
+//     // 3) endIdx   = lastResponseIdx 다음으로 가장 가까운 `›`/status_bar/separator 직전
+//   }
+//
+//   export async function onHookEvent(event, sdk) {
+//     if (event.event !== "turn-complete") return;
+//     const windowName = tmuxWindowName();
+//     const tail       = capturePaneTail();
+//     const turn       = extractLastTurn(tail);
+//     if (turnLines < 2) return;                      // 너무 짧은 turn skip
+//     const fp = fingerprint(turn);
+//     if (fp === await sdk.state.read(`last-fp:${windowName}`)) return; // dedup
+//     const r = ccbotSend(windowName, `📟 [${windowName}]\n\`\`\`\n${turn}\n\`\`\``);
+//     if (r.ok) await sdk.state.write(`last-fp:${windowName}`, fp);
+//     await sdk.log.info?.("...", { ... });           // 모든 분기에 sdk.log.info 로 진단 흔적
+//   }
+//
+// 검증된 노하우:
+//   - PROMPT_RE 단독 anchor 는 placeholder("› Use /skills..." / "› Implement {feature}")에
+//     잘못 걸려 turn 이 비어 silent skip → RESPONSE_RE(`•`) anchor 로 우회.
+//   - tmux send-keys 직접 입력은 codex multi-line composer 가 newline 으로 처리 → ccbot
+//     본체의 `_send_via_paste` (set-buffer + paste-buffer + Enter) 경로 필수.
+//   - Hook plugin runner 는 fnm shim PATH 가 안 잡힐 수 있어 CCBOT_BIN 절대경로.
+//   - 모든 early-return 에 sdk.log.info 흔적 — 0 byte push 디버깅 시 핵심.
 ```
 
 - [ ] **Step 3: omx hook validate**

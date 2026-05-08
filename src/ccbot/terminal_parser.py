@@ -261,6 +261,9 @@ def parse_codex_status_line(pane_text: str) -> str | None:
     return None
 
 
+_BACKGROUND_SHELL_RE = re.compile(r"\b\d+\s+shells?\s+still\s+running\b")
+
+
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
@@ -270,6 +273,12 @@ def parse_status_line(pane_text: str) -> str | None:
     false positives from ``·`` bullets in Claude's regular output.
 
     Returns the text after the spinner, or None if no status line found.
+
+    Background-only indicator filter: when the spinner text only reflects a
+    surviving backgrounded Bash tool (e.g. ``Sautéed for 3s · 1 shell still
+    running``) and contains no active working signal (``esc to interrupt``),
+    the turn is effectively over — return None so a new status message is not
+    enqueued and left stale once the background shell exits.
     """
     if not pane_text:
         return None
@@ -294,7 +303,13 @@ def parse_status_line(pane_text: str) -> str | None:
         if not line:
             continue
         if line[0] in STATUS_SPINNERS:
-            return line[1:].strip()
+            rest = line[1:].strip()
+            if (
+                _BACKGROUND_SHELL_RE.search(rest)
+                and "esc to interrupt" not in rest.lower()
+            ):
+                return None
+            return rest
         # First non-empty line above separator isn't a spinner → no status
         return None
     return None

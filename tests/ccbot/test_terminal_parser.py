@@ -62,6 +62,49 @@ class TestParseStatusLine:
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
 
+    @pytest.mark.parametrize(
+        "spinner_text",
+        [
+            "· Sautéed for 3s · 1 shell still running",
+            "· Sautéed for 12s · 2 shells still running",
+            "✻ Generating… (3s · 1 shell still running)",
+        ],
+    )
+    def test_background_shell_indicator_not_status(
+        self, spinner_text: str, chrome: str
+    ):
+        """Spinner line that only indicates background shells (no active working
+        signal like 'esc to interrupt') must not be treated as a working status.
+
+        These lines appear briefly after a turn ends while a backgrounded Bash
+        tool is still alive — the user is free to send the next message, so we
+        must not enqueue a stale status message that would persist after the
+        background shell exits.
+        """
+        pane = f"some output\n{spinner_text}\n{chrome}"
+        assert parse_status_line(pane) is None
+
+    @pytest.mark.parametrize(
+        ("spinner_text", "expected"),
+        [
+            (
+                "· Sautéed for 3s · esc to interrupt",
+                "Sautéed for 3s · esc to interrupt",
+            ),
+            (
+                "✻ Generating… (12s · ↓ 2k tokens · esc to interrupt)",
+                "Generating… (12s · ↓ 2k tokens · esc to interrupt)",
+            ),
+        ],
+    )
+    def test_active_working_still_detected(
+        self, spinner_text: str, expected: str, chrome: str
+    ):
+        """Active working spinner ('esc to interrupt' present) must still be
+        detected — only background-only indicators are filtered out."""
+        pane = f"some output\n{spinner_text}\n{chrome}"
+        assert parse_status_line(pane) == expected
+
 
 # ── extract_interactive_content ──────────────────────────────────────────
 

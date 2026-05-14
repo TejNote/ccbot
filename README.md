@@ -343,44 +343,9 @@ src/ccbot/
 
 ## Changelog (fork)
 
-Tracked here so internal contributors can see what changed relative to upstream `six-ddc/ccbot`. Most recent first.
+상세 변경 이력은 [`CHANGELOG.md`](./CHANGELOG.md) 참고. 버전 정책은 [SemVer](https://semver.org/lang/ko/)를 따르고, 포맷은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/) 기준입니다.
 
-### 2026-05-08
-
-- **PR [#5](https://github.com/TejNote/ccbot/pull/5) `fix:` parse_status_line ignores background-shell-only spinners** — Lines like `· Sautéed for 3s · 1 shell still running` (no `esc to interrupt` signal) are no longer enqueued as status updates, eliminating stale status messages that lingered on Telegram after a turn ended.
-- **PR [#4](https://github.com/TejNote/ccbot/pull/4) `feat:` Codex topic routing** — `WindowState.provider`, `detect_window_provider`, paste-buffer send path, `parse_codex_status_line`, OMX `ccbot-bridge.mjs` hook, fixtures (`codex_thinking_trace.txt`), and tests (`TestWindowProvider`, `TestResolveRouting`, `TestParseCodexStatusLine`, `test_status_polling_codex.py`).
-- **PR [#2](https://github.com/TejNote/ccbot/pull/2) `fix:` keep answer as last message** — Status display delegated to `status_polling`; content tasks no longer immediately re-enqueue a status update. Status message IDs are persisted in `state.json` and orphans cleaned on restart.
-
-### 2026-05-06
-
-- `fix:` `/clear` no longer leaves a stale `session_map` entry — the next message correctly maps to the new session.
-- `feat:` skill scanning includes `commands/` directories (e.g. `/octo:octo`, all CLI slash commands) and budgets descriptions to stay under Telegram's ~5000-char total command limit.
-- `fix:` total bot-command count capped at 100 (Telegram API limit) with sane truncation.
-
-### 2026-04-28
-
-- `feat:` route command/photo/voice acknowledgements through `enqueue_direct_message` so they don't interleave with Claude responses.
-- `feat:` `DirectMessage` task type added to the queue; `enqueue_direct_message` for ordered delivery.
-
-### 2026-04-27
-
-- `feat:` `SkillRegistry` integrated into the bot (`/favorite`, usage tracking, command menu).
-- `feat:` `MessageBatcher` for timed grouping of tool-use / thinking events; `CCBOT_BATCH_WINDOW` config.
-- `fix:` hook strips quotes from `.env` values and normalizes `TMUX_SESSION_NAME`.
-- `fix:` `send_keys` checks Claude busy state before transmission to prevent silent drops.
-- PR [#1](https://github.com/TejNote/ccbot/pull/1) `fix:` batch summary correctly traverses the message queue.
-
-### Pending upstream merges
-
-These commits are on `six-ddc/ccbot` `main` but not yet reconciled into this fork:
-
-| Upstream commit                                                          | Note                                                                |
-| ------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| [`865ab89`](https://github.com/six-ddc/ccbot/commit/865ab89) (#67)       | Fix interactive UI creating duplicate messages on button press      |
-| [`350c653`](https://github.com/six-ddc/ccbot/commit/350c653) (#73)       | Stop renaming user-created Telegram topics on bind                  |
-| [`f5ddd7f`](https://github.com/six-ddc/ccbot/commit/f5ddd7f)             | Show correct line count for Write tool results                      |
-
-Plan: cherry-pick or merge in a follow-up PR.
+현재 버전: **v1.0.0** (TejNote fork 첫 공식 릴리스, 2026-05-14).
 
 ## Contributing back upstream
 

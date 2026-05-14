@@ -345,7 +345,7 @@ src/ccbot/
 
 상세 변경 이력은 [`CHANGELOG.md`](./CHANGELOG.md) 참고. 버전 정책은 [SemVer](https://semver.org/lang/ko/)를 따르고, 포맷은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/) 기준입니다.
 
-현재 버전: **v1.0.0** (TejNote fork 첫 공식 릴리스, 2026-05-14).
+현재 버전: **v1.0.1** (upstream pending merge 3건 reconcile, 2026-05-14).
 
 ## Contributing back upstream
 

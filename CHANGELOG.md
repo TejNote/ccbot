@@ -14,6 +14,17 @@
 
 ---
 
+## [1.0.2] - 2026-05-18
+
+문서 보정. 코드 변경 없음.
+
+### Changed
+
+- `CLAUDE.md` 상단에 자동 로드 체인 + 상위 위임 안내 추가 (Personal 프로젝트, `~/.claude/CLAUDE.md` 글로벌만 자동 로드)
+- 관련 운영 메모리 명시: `reference_ccbot_infra.md`, `reference_ccbot_versioning.md`, `feedback_ccbot_version_bump_required.md`
+
+---
+
 ## [1.0.1] - 2026-05-14
 
 upstream `six-ddc/ccbot` pending merge 3건을 cherry-pick. 버그픽스 only.

@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+> ℹ️ Personal 프로젝트 — `~/.claude/CLAUDE.md` 글로벌만 자동 로드 (Insudeal 컨벤션 무관). 시크릿·push 룰은 글로벌 위임. ccbot 운영 메모리: `reference_ccbot_infra.md`, `reference_ccbot_versioning.md`, `feedback_ccbot_version_bump_required.md`.
+
 ccmux — Telegram bot that bridges Telegram Forum topics to Claude Code sessions via tmux windows. Each topic is bound to one tmux window running one Claude Code instance.
 
 Tech stack: Python, python-telegram-bot, tmux, uv.

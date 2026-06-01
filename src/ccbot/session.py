@@ -242,10 +242,44 @@ class SessionManager:
         """
         windows = await tmux_manager.list_windows()
         live_by_name: dict[str, str] = {}  # window_name -> window_id
+        live_by_id: dict[str, str] = {}  # window_id -> window_name
         live_ids: set[str] = set()
         for w in windows:
             live_by_name[w.window_name] = w.window_id
+            live_by_id[w.window_id] = w.window_name
             live_ids.add(w.window_id)
+
+        # tmux re-numbers window IDs from @0 on every server (re)start, so a
+        # persisted ID can still be "live" yet point at a *different* window.
+        # An ID is only trustworthy when its live window name still matches the
+        # name we persisted for it; otherwise we must remap by display name.
+        # Snapshot display names up front: the loops below mutate
+        # window_display_names, and all three (window_states, thread_bindings,
+        # offsets) must resolve against the pre-mutation names.
+        orig_display = dict(self.window_display_names)
+        orig_ws_names = {
+            wid: ws.window_name
+            for wid, ws in self.window_states.items()
+            if ws.window_name
+        }
+
+        def persisted_name(wid: str) -> str:
+            """The name we last knew this window_id by, for re-resolution.
+
+            Prefers the display-name snapshot, falling back to WindowState's
+            own name (covers old-format state.json where display names were
+            not yet populated), then the raw id. All three migration loops use
+            this so they stay symmetric.
+            """
+            return orig_display.get(wid) or orig_ws_names.get(wid) or wid
+
+        def is_trustworthy(wid: str) -> bool:
+            """True when a live window_id still maps to its persisted name.
+
+            tmux reuses IDs across server restarts, so a live ID may now point
+            at a different window; only trust it when the live name matches.
+            """
+            return wid in live_ids and live_by_id.get(wid) == persisted_name(wid)
 
         changed = False
 
@@ -253,15 +287,16 @@ class SessionManager:
         new_window_states: dict[str, WindowState] = {}
         for key, ws in self.window_states.items():
             if self._is_window_id(key):
-                if key in live_ids:
+                display = persisted_name(key)
+                if is_trustworthy(key):
                     new_window_states[key] = ws
                 else:
-                    # Stale ID — try re-resolve by display name
-                    display = self.window_display_names.get(key, ws.window_name or key)
+                    # Stale ID, or a live ID that now points at a different
+                    # window — re-resolve by display name.
                     new_id = live_by_name.get(display)
                     if new_id:
                         logger.info(
-                            "Re-resolved stale window_id %s -> %s (name=%s)",
+                            "Re-resolved window_id %s -> %s (name=%s)",
                             key,
                             new_id,
                             display,
@@ -269,7 +304,8 @@ class SessionManager:
                         new_window_states[new_id] = ws
                         ws.window_name = display
                         self.window_display_names[new_id] = display
-                        self.window_display_names.pop(key, None)
+                        if new_id != key:
+                            self.window_display_names.pop(key, None)
                         changed = True
                     else:
                         logger.info(
@@ -297,10 +333,10 @@ class SessionManager:
             new_bindings: dict[int, str] = {}
             for tid, val in bindings.items():
                 if self._is_window_id(val):
-                    if val in live_ids:
+                    display = persisted_name(val)
+                    if is_trustworthy(val):
                         new_bindings[tid] = val
                     else:
-                        display = self.window_display_names.get(val, val)
                         new_id = live_by_name.get(display)
                         if new_id:
                             logger.info(
@@ -348,10 +384,10 @@ class SessionManager:
             new_offsets: dict[str, int] = {}
             for key, offset in offsets.items():
                 if self._is_window_id(key):
-                    if key in live_ids:
+                    display = persisted_name(key)
+                    if is_trustworthy(key):
                         new_offsets[key] = offset
                     else:
-                        display = self.window_display_names.get(key, key)
                         new_id = live_by_name.get(display)
                         if new_id:
                             new_offsets[new_id] = offset

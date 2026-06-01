@@ -14,6 +14,21 @@
 
 ---
 
+## [1.0.3] - 2026-06-01
+
+재부팅 후 텔레그램 토픽이 엉뚱한 창으로 라우팅되던 버그 수정.
+
+### Fixed
+
+- **window_id 재사용으로 인한 토픽 오라우팅** (`session.py` `resolve_stale_ids`)
+  - tmux는 서버 재시작마다 window ID를 `@0`부터 다시 매겨서, 재부팅 전후로 `@6` 같은 ID가 **그대로 존재하지만 다른 창을 가리킬** 수 있음 (예: 창 추가로 ID가 한 칸씩 밀림 → 과거 codex(`@6`)에 바인딩된 토픽이 재부팅 후 claude(`@6`)로 연결)
+  - 기존 로직은 "window_id가 live하면 무조건 신뢰"해서 ID가 가리키는 창이 바뀐 걸 감지 못함
+  - 수정: live window의 실제 이름과 영속화된 display name을 대조(`is_trustworthy`)해 불일치 시 display name 기준으로 재매핑. `window_states`·`thread_bindings`·`user_window_offsets` 3곳 모두 적용
+  - display name 스냅샷(`orig_display`)으로 세 루프 간 in-place 변경 순서 의존성 제거
+  - 회귀 테스트 4건 추가 (`TestResolveStaleIds`)
+
+---
+
 ## [1.0.2] - 2026-05-18
 
 문서 보정. 코드 변경 없음.

@@ -2,7 +2,8 @@
 
 import pytest
 
-from ccbot.session import SessionManager
+from ccbot.session import SessionManager, WindowState
+from ccbot.tmux_manager import TmuxWindow
 
 
 @pytest.fixture
@@ -242,3 +243,161 @@ class TestWindowProvider:
         assert "@2" in mgr.window_states
         assert mgr.get_window_state("@2").window_name == "codex"
         assert mgr.get_window_provider("@2") == "codex"
+
+
+class TestResolveStaleIds:
+    """Startup re-resolution when tmux re-assigns window IDs after a reboot.
+
+    tmux re-numbers window IDs from @0 on every server (re)start, so a
+    persisted ID like @6 can still exist but now point at a *different*
+    window. The old logic trusted any window_id that was merely live,
+    silently routing topics to the wrong window. Re-resolution must compare
+    the persisted display name against the live window's actual name and
+    remap by name when they disagree.
+    """
+
+    def _patch_session_map(self, monkeypatch, tmp_path):
+        session_map = tmp_path / "session_map.json"
+        session_map.write_text("{}")
+        monkeypatch.setattr("ccbot.session.config.session_map_file", session_map)
+        monkeypatch.setattr("ccbot.session.config.tmux_session_name", "ccbot")
+
+    def _patch_live_windows(self, monkeypatch, windows: list[TmuxWindow]):
+        async def fake_list_windows():
+            return windows
+
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_windows", fake_list_windows
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_binding_follows_display_name_when_id_reused(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """A live-but-reassigned window_id must remap by display name.
+
+        Past boot: codex topic (thread 1) bound to @6, whose name was 'codex'.
+        After reboot an extra window shifted IDs: @6 is now 'claude', codex
+        moved to @7. The codex topic must follow the name to @7.
+        """
+        self._patch_session_map(monkeypatch, tmp_path)
+        mgr.thread_bindings[100] = {1: "@6"}
+        mgr.window_display_names["@6"] = "codex"
+        mgr.window_states["@6"] = WindowState(
+            session_id="old-codex-sid", cwd="/tmp/codex", window_name="codex"
+        )
+        self._patch_live_windows(
+            monkeypatch,
+            [
+                TmuxWindow(window_id="@6", window_name="claude", cwd="/tmp/claude"),
+                TmuxWindow(window_id="@7", window_name="codex", cwd="/tmp/codex"),
+            ],
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.thread_bindings[100][1] == "@7"
+
+    @pytest.mark.asyncio
+    async def test_window_state_follows_display_name_when_id_reused(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """window_states keyed by a reassigned id must move to the right id."""
+        self._patch_session_map(monkeypatch, tmp_path)
+        mgr.window_display_names["@4"] = "smoking"
+        mgr.window_states["@4"] = WindowState(
+            session_id="smoking-sid", cwd="/tmp/smoking", window_name="smoking"
+        )
+        self._patch_live_windows(
+            monkeypatch,
+            [
+                TmuxWindow(window_id="@3", window_name="insudeal", cwd="/tmp/ins"),
+                TmuxWindow(window_id="@4", window_name="scraping", cwd="/tmp/scr"),
+                TmuxWindow(window_id="@5", window_name="smoking", cwd="/tmp/smoking"),
+            ],
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert "@5" in mgr.window_states
+        assert mgr.window_states["@5"].session_id == "smoking-sid"
+        # @4 must no longer hold the stale smoking state
+        assert mgr.window_states.get("@4") is None or (
+            mgr.window_states["@4"].session_id != "smoking-sid"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unchanged_window_is_left_intact(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """When the id still points at the same-named window, keep it as-is.
+
+        Guards against churning a window that was merely renamed-in-place and
+        already reconciled (display name matches live name).
+        """
+        self._patch_session_map(monkeypatch, tmp_path)
+        mgr.thread_bindings[100] = {1: "@6"}
+        mgr.window_display_names["@6"] = "claude"
+        mgr.window_states["@6"] = WindowState(
+            session_id="claude-sid", cwd="/tmp/claude", window_name="claude"
+        )
+        self._patch_live_windows(
+            monkeypatch,
+            [TmuxWindow(window_id="@6", window_name="claude", cwd="/tmp/claude")],
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.thread_bindings[100][1] == "@6"
+        assert mgr.window_states["@6"].session_id == "claude-sid"
+
+    @pytest.mark.asyncio
+    async def test_user_offset_follows_display_name_when_id_reused(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """The per-user read offset must travel with the window, not the id."""
+        self._patch_session_map(monkeypatch, tmp_path)
+        mgr.window_display_names["@4"] = "smoking"
+        mgr.window_states["@4"] = WindowState(
+            session_id="smoking-sid", cwd="/tmp/smoking", window_name="smoking"
+        )
+        mgr.user_window_offsets[100] = {"@4": 500}
+        self._patch_live_windows(
+            monkeypatch,
+            [
+                TmuxWindow(window_id="@4", window_name="scraping", cwd="/tmp/scr"),
+                TmuxWindow(window_id="@5", window_name="smoking", cwd="/tmp/smoking"),
+            ],
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.user_window_offsets[100].get("@5") == 500
+        assert "@4" not in mgr.user_window_offsets[100]
+
+    @pytest.mark.asyncio
+    async def test_thread_binding_remaps_via_window_state_name_when_display_absent(
+        self, mgr: SessionManager, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """Old-format upgrade: window_display_names is empty but WindowState
+        still carries the name. The thread binding must remap by that name,
+        not get dropped — the window_states loop already uses window_name as
+        a fallback, so the thread_bindings loop must stay symmetric.
+        """
+        self._patch_session_map(monkeypatch, tmp_path)
+        mgr.thread_bindings[100] = {1: "@6"}
+        mgr.window_states["@6"] = WindowState(
+            session_id="codex-sid", cwd="/tmp/codex", window_name="codex"
+        )
+        # Intentionally do NOT set window_display_names["@6"].
+        self._patch_live_windows(
+            monkeypatch,
+            [
+                TmuxWindow(window_id="@6", window_name="claude", cwd="/tmp/claude"),
+                TmuxWindow(window_id="@7", window_name="codex", cwd="/tmp/codex"),
+            ],
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.thread_bindings[100][1] == "@7"

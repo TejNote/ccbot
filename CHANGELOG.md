@@ -14,6 +14,24 @@
 
 ---
 
+## [1.0.5] - 2026-07-24
+
+state.json·로그 잔재 누적 정리 (재부팅마다 쌓이던 것들).
+
+### Fixed
+
+- **display_names 고아 항목 startup prune** (`session.py` `resolve_stale_ids`)
+  - tmux는 서버 재시작마다 window ID를 다시 매겨, 사라진 창(예: 제거된 `codex`)의 `window_display_names` 항목이 매 재부팅 누적됨 (무해하나 state.json 오염)
+  - 수정: `resolve_stale_ids` 끝에서 `window_states`에 대응 없는 display-name 항목 제거. **단 `thread_bindings`에 참조된 window_id(셸 전용 `main` 창처럼 window_state가 없는 경우)는 보존** — 그래야 재부팅 후 이름 기준 재바인딩으로 복구 가능. 회귀 테스트 3건 (`TestOrphanDisplayNamePrune`)
+
+### Changed
+
+- **로그 기본 레벨 DEBUG → INFO** (`main.py`)
+  - `ccbot` 로거가 DEBUG여서 `State saved`·`Saved N tracked sessions` 등 per-event 스팸이 `ccbot-autostart.log`를 무한 누적(4개월 67MB 실측)
+  - 기본 INFO로 낮춰 누적 속도 대폭 감소. `CCBOT_DEBUG=1` 환경변수로 DEBUG 복원 가능
+
+---
+
 ## [1.0.4] - 2026-07-24
 
 재부팅·절전복귀 시 텔레그램 토픽 바인딩이 서서히 전부 지워지던 버그 수정.

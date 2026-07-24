@@ -401,3 +401,71 @@ class TestResolveStaleIds:
         await mgr.resolve_stale_ids()
 
         assert mgr.thread_bindings[100][1] == "@7"
+
+
+class TestOrphanDisplayNamePrune:
+    """resolve_stale_ids must prune display-name entries for window_ids that
+    have no live window and no window_state. tmux re-numbers IDs every server
+    restart, so stale display names (e.g. a removed 'codex' window) accumulate
+    forever otherwise — harmless but they pile up in state.json each reboot.
+    """
+
+    def _patch_env(self, monkeypatch, tmp_path):
+        sm = tmp_path / "session_map.json"
+        sm.write_text("{}")
+        monkeypatch.setattr("ccbot.session.config.session_map_file", sm)
+        monkeypatch.setattr("ccbot.session.config.tmux_session_name", "ccbot")
+
+        async def fake_list_windows():
+            return [TmuxWindow(window_id="@0", window_name="main", cwd="/tmp")]
+
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_windows", fake_list_windows
+        )
+
+    @pytest.mark.asyncio
+    async def test_orphan_display_name_pruned(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        self._patch_env(monkeypatch, tmp_path)
+        # Live window @0 (main) has a matching state; @7 (codex) is a pure orphan.
+        mgr.window_display_names["@0"] = "main"
+        mgr.window_display_names["@7"] = "codex"
+        mgr.window_states["@0"] = WindowState(
+            session_id="s", cwd="/tmp", window_name="main"
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert "@7" not in mgr.window_display_names  # orphan pruned
+        assert mgr.window_display_names.get("@0") == "main"  # live kept
+
+    @pytest.mark.asyncio
+    async def test_bound_window_display_name_not_pruned(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """A display name still referenced by a live window_state must survive."""
+        self._patch_env(monkeypatch, tmp_path)
+        mgr.window_display_names["@0"] = "main"
+        mgr.window_states["@0"] = WindowState(
+            session_id="s", cwd="/tmp", window_name="main"
+        )
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.window_display_names.get("@0") == "main"
+
+    @pytest.mark.asyncio
+    async def test_bound_window_display_name_kept_without_state(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        """A window_id referenced by thread_bindings but lacking a window_state
+        (the shell-only 'main' window) must keep its display name, so name-based
+        rebinding can still recover it after a reboot."""
+        self._patch_env(monkeypatch, tmp_path)
+        mgr.window_display_names["@0"] = "main"
+        mgr.thread_bindings[100] = {16943: "@0"}  # bound, but no window_state
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.window_display_names.get("@0") == "main"  # kept (bound)

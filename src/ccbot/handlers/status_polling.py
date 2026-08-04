@@ -128,6 +128,41 @@ async def update_status_message(
     # If no status line, keep existing status message (don't clear on transient state)
 
 
+async def resolve_binding_window(user_id: int, thread_id: int, wid: str):
+    """Resolve the tmux window a thread binding points at.
+
+    tmux re-numbers window IDs from @0 on every server (re)start (reboot,
+    sleep-wake), so a persisted window_id can stop resolving even though the
+    same window is alive under a new ID. Before treating a binding as dead,
+    re-resolve it by the name we persisted for that window and remap the
+    binding to the new ID.
+
+    Returns the live TmuxWindow, or None when no window with the binding's
+    persisted name exists (the window is truly gone → caller should unbind).
+    """
+    w = await tmux_manager.find_window_by_id(wid)
+    if w:
+        return w
+
+    name = session_manager.get_display_name(wid)
+    if name and name != wid:
+        w = await tmux_manager.find_window_by_name(name)
+        if w:
+            session_manager.bind_thread(
+                user_id, thread_id, w.window_id, window_name=name
+            )
+            logger.info(
+                "Remapped stale binding by name: user=%d thread=%d %s -> %s (%s)",
+                user_id,
+                thread_id,
+                wid,
+                w.window_id,
+                name,
+            )
+            return w
+    return None
+
+
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
@@ -176,8 +211,9 @@ async def status_poll_loop(bot: Bot) -> None:
 
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
-                    # Clean up stale bindings (window no longer exists)
-                    w = await tmux_manager.find_window_by_id(wid)
+                    # Resolve the bound window, remapping by name if tmux
+                    # re-numbered IDs. Only unbind when the window is truly gone.
+                    w = await resolve_binding_window(user_id, thread_id, wid)
                     if not w:
                         session_manager.unbind_thread(user_id, thread_id)
                         await clear_topic_state(user_id, thread_id, bot)
@@ -188,6 +224,8 @@ async def status_poll_loop(bot: Bot) -> None:
                             wid,
                         )
                         continue
+                    # Binding may have been remapped to a new id.
+                    wid = w.window_id
 
                     # UI detection happens unconditionally in update_status_message.
                     # Status enqueue is skipped inside update_status_message when

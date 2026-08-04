@@ -69,3 +69,9 @@ venv.bak/
 # Project specific
 .uv/
 uv.lock
+
+# AI 지침 파일 (AGENTS.md 정본 + CLAUDE.md 셔틀은 커밋, .local 개인지침은 제외)
+!/AGENTS.md
+!/CLAUDE.md
+/AGENTS.local.md
+/CLAUDE.local.md

@@ -403,6 +403,26 @@ class SessionManager:
                         changed = True
             self.user_window_offsets[uid] = new_offsets
 
+        # --- Prune orphaned display names ---
+        # tmux re-numbers IDs every server restart; display-name entries for
+        # window_ids with no surviving window_state are stale leftovers that
+        # otherwise accumulate in state.json on every reboot (e.g. a removed
+        # 'codex' window). Harmless but noisy — drop them here.
+        # Keep names still referenced by a thread binding even when they have no
+        # window_state (the shell-only 'main' window), so name-based rebinding
+        # can still recover them after a reboot.
+        bound_wids = {
+            wid for binds in self.thread_bindings.values() for wid in binds.values()
+        }
+        orphan_display = [
+            wid
+            for wid in self.window_display_names
+            if wid not in self.window_states and wid not in bound_wids
+        ]
+        for wid in orphan_display:
+            del self.window_display_names[wid]
+            changed = True
+
         if changed:
             self._save_state()
             logger.info("Startup re-resolution complete")

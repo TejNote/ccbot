@@ -7,6 +7,7 @@ Handles two execution modes:
 """
 
 import logging
+import os
 import sys
 
 
@@ -46,7 +47,11 @@ def main() -> None:
         print("Get your user ID from @userinfobot on Telegram.")
         sys.exit(1)
 
-    logging.getLogger("ccbot").setLevel(logging.DEBUG)
+    # Default INFO to keep the autostart log from ballooning with per-event
+    # DEBUG spam ("State saved", "Saved N tracked sessions"). Set CCBOT_DEBUG=1
+    # in the environment to restore DEBUG for troubleshooting.
+    _log_level = logging.DEBUG if os.environ.get("CCBOT_DEBUG") else logging.INFO
+    logging.getLogger("ccbot").setLevel(_log_level)
     # AIORateLimiter (max_retries=5) handles retries itself; keep INFO for visibility
     logging.getLogger("telegram.ext.AIORateLimiter").setLevel(logging.INFO)
     logger = logging.getLogger(__name__)

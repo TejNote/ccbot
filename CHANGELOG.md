@@ -14,6 +14,38 @@
 
 ---
 
+## [1.0.5] - 2026-07-24
+
+state.json·로그 잔재 누적 정리 (재부팅마다 쌓이던 것들).
+
+### Fixed
+
+- **display_names 고아 항목 startup prune** (`session.py` `resolve_stale_ids`)
+  - tmux는 서버 재시작마다 window ID를 다시 매겨, 사라진 창(예: 제거된 `codex`)의 `window_display_names` 항목이 매 재부팅 누적됨 (무해하나 state.json 오염)
+  - 수정: `resolve_stale_ids` 끝에서 `window_states`에 대응 없는 display-name 항목 제거. **단 `thread_bindings`에 참조된 window_id(셸 전용 `main` 창처럼 window_state가 없는 경우)는 보존** — 그래야 재부팅 후 이름 기준 재바인딩으로 복구 가능. 회귀 테스트 3건 (`TestOrphanDisplayNamePrune`)
+
+### Changed
+
+- **로그 기본 레벨 DEBUG → INFO** (`main.py`)
+  - `ccbot` 로거가 DEBUG여서 `State saved`·`Saved N tracked sessions` 등 per-event 스팸이 `ccbot-autostart.log`를 무한 누적(4개월 67MB 실측)
+  - 기본 INFO로 낮춰 누적 속도 대폭 감소. `CCBOT_DEBUG=1` 환경변수로 DEBUG 복원 가능
+
+---
+
+## [1.0.4] - 2026-07-24
+
+재부팅·절전복귀 시 텔레그램 토픽 바인딩이 서서히 전부 지워지던 버그 수정.
+
+### Fixed
+
+- **런타임 stale binding 삭제 → 이름 기준 재매핑으로 전환** (`handlers/status_polling.py`)
+  - 증상: 재부팅/절전복귀가 반복되면 `thread_bindings`가 하나씩 비다가 결국 `{}`가 되어, ccbot이 살아있어도 모든 창 출력이 `No active users`로 버려짐 (텔레그램 응답 없음)
+  - 원인: `status_poll_loop`의 cleanup이 바인딩된 window_id(`@5`·`@6` 등)를 `find_window_by_id`로만 확인하고, 없으면 즉시 `unbind_thread`로 **영구 삭제**. tmux는 서버 재시작마다 ID를 `@0`부터 다시 매기므로, 같은 창이 살아있어도 ID가 바뀌면 삭제됨. 1.0.3의 재매핑은 **load 시점(`session.py` migrate)에만** 적용돼 런타임 폴러엔 빠져 있었음
+  - 수정: `resolve_binding_window()` 헬퍼 신설 — window_id로 못 찾으면 영속화된 창 이름으로 `find_window_by_name` 재조회 후 새 ID로 remap. 이름으로도 없을 때만 unbind (창이 진짜 사라진 경우)
+  - 회귀 테스트 3건 추가 (`test_status_polling_rebind.py`): remap·live-passthrough·truly-dead
+
+---
+
 ## [1.0.3] - 2026-06-01
 
 재부팅 후 텔레그램 토픽이 엉뚱한 창으로 라우팅되던 버그 수정.

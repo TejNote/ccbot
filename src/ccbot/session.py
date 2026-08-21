@@ -22,12 +22,13 @@ Key methods for thread binding access:
 """
 
 import asyncio
+import fcntl
 import json
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any, Literal
 
 import aiofiles
@@ -427,36 +428,132 @@ class SessionManager:
             self._save_state()
             logger.info("Startup re-resolution complete")
 
-        # Clean up session_map.json: stale window IDs and old-format keys
+        # Clean up session_map.json: stale window IDs, migrate old-format keys
         await self._cleanup_stale_session_map_entries(live_ids)
-        await self._cleanup_old_format_session_map_keys()
+        await self._migrate_old_format_session_map_keys(live_by_name)
 
-    async def _cleanup_old_format_session_map_keys(self) -> None:
-        """Remove old-format keys (window_name instead of @window_id) from session_map.json."""
-        if not config.session_map_file.exists():
-            return
-        try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
-            return
+    def _migrate_old_format_map(
+        self, session_map: dict[str, dict], live_by_name: dict[str, str]
+    ) -> bool:
+        """Migrate old-format session_map keys to the @window_id form in place.
 
+        Old hook versions keyed session_map by window_name (e.g. "ccbot:ccmux")
+        instead of window_id ("ccbot:@4"). Such keys are invisible to the
+        window_id-based delivery path (load_session_map skips them), which
+        silently drops inbound messages. This resolves each old-format key's
+        window_name against live tmux windows and rewrites it to the @window_id
+        form, preserving session_id/cwd and backfilling window_name. Keys with
+        no matching live window are dropped as orphans; if the @window_id key
+        already exists it wins and the old-format one is discarded.
+
+        Mutates session_map in place. Returns True if anything changed.
+        """
         prefix = f"{config.tmux_session_name}:"
         old_keys = [
             key
             for key in session_map
             if key.startswith(prefix) and not self._is_window_id(key[len(prefix) :])
         ]
-        if not old_keys:
-            return
-
+        changed = False
         for key in old_keys:
-            del session_map[key]
-        atomic_write_json(config.session_map_file, session_map)
-        logger.info(
-            "Cleaned up %d old-format session_map keys: %s", len(old_keys), old_keys
+            window_name = key[len(prefix) :]
+            info = session_map.pop(key)
+            changed = True
+            new_id = live_by_name.get(window_name)
+            if not new_id:
+                logger.info("Dropping orphan old-format session_map key: %s", key)
+                continue
+            new_key = f"{prefix}{new_id}"
+            if new_key in session_map:
+                logger.info(
+                    "Discarding old-format session_map key %s (superseded by %s)",
+                    key,
+                    new_key,
+                )
+                continue
+            info.setdefault("window_name", window_name)
+            session_map[new_key] = info
+            logger.info("Migrated old-format session_map key %s -> %s", key, new_key)
+        return changed
+
+    def _mutate_session_map_locked(
+        self, mutate: Callable[[dict[str, dict]], bool]
+    ) -> bool:
+        """Read-modify-write session_map.json under the same flock the hook uses.
+
+        The SessionStart hook serializes its writes via session_map.lock;
+        any bot-side read-modify-write MUST take the same lock or it can
+        overwrite a concurrent hook write (lost update). Synchronous —
+        call via asyncio.to_thread from async code.
+
+        Returns True if `mutate` reported changes and the file was rewritten.
+        """
+        map_file = config.session_map_file
+        lock_path = map_file.with_suffix(".lock")
+        try:
+            with open(lock_path, "w") as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    session_map: dict[str, dict] = {}
+                    if map_file.exists():
+                        try:
+                            session_map = json.loads(map_file.read_text())
+                        except (json.JSONDecodeError, OSError):
+                            logger.warning(
+                                "Unreadable session_map.json, skipping mutation"
+                            )
+                            return False
+                    if not mutate(session_map):
+                        return False
+                    atomic_write_json(map_file, session_map)
+                    return True
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+        except OSError as e:
+            logger.error("Failed to update session_map.json: %s", e)
+            return False
+
+    async def override_session_map_entry(
+        self, window_id: str, session_id: str, cwd: str = "", window_name: str = ""
+    ) -> None:
+        """Force a window's session_map entry to a specific session_id.
+
+        Used after `--resume`: session_map drives both the monitor's watch
+        list and load_session_map()'s sync into window_states, so overriding
+        window_state alone would be reverted on the next poll cycle. Creates
+        the entry if missing (hook timed out); no-op if already consistent.
+        """
+        key = f"{config.tmux_session_name}:{window_id}"
+
+        def mutate(session_map: dict[str, dict]) -> bool:
+            info = session_map.get(key)
+            if info is None:
+                session_map[key] = {
+                    "session_id": session_id,
+                    "cwd": cwd,
+                    "window_name": window_name,
+                }
+                return True
+            if info.get("session_id") == session_id:
+                return False
+            info["session_id"] = session_id
+            return True
+
+        if await asyncio.to_thread(self._mutate_session_map_locked, mutate):
+            logger.info("session_map override: %s -> session_id=%s", key, session_id)
+
+    async def _migrate_old_format_session_map_keys(
+        self, live_by_name: dict[str, str]
+    ) -> None:
+        """Migrate old-format keys in session_map.json to @window_id form (startup)."""
+        if not config.session_map_file.exists():
+            return
+        changed = await asyncio.to_thread(
+            self._mutate_session_map_locked,
+            lambda session_map: self._migrate_old_format_map(session_map, live_by_name),
         )
+        if changed:
+            logger.info("Migrated old-format session_map keys to @window_id form")
 
     async def _cleanup_stale_session_map_entries(self, live_ids: set[str]) -> None:
         """Remove entries for tmux windows that no longer exist.
@@ -467,33 +564,26 @@ class SessionManager:
         """
         if not config.session_map_file.exists():
             return
-        try:
-            async with aiofiles.open(config.session_map_file, "r") as f:
-                content = await f.read()
-            session_map = json.loads(content)
-        except (json.JSONDecodeError, OSError):
-            return
 
         prefix = f"{config.tmux_session_name}:"
-        stale_keys = [
-            key
-            for key in session_map
-            if key.startswith(prefix)
-            and self._is_window_id(key[len(prefix) :])
-            and key[len(prefix) :] not in live_ids
-        ]
-        if not stale_keys:
-            return
 
-        for key in stale_keys:
-            del session_map[key]
-            logger.info("Removed stale session_map entry: %s", key)
+        def mutate(session_map: dict[str, dict]) -> bool:
+            stale_keys = [
+                key
+                for key in session_map
+                if key.startswith(prefix)
+                and self._is_window_id(key[len(prefix) :])
+                and key[len(prefix) :] not in live_ids
+            ]
+            for key in stale_keys:
+                del session_map[key]
+                logger.info("Removed stale session_map entry: %s", key)
+            return bool(stale_keys)
 
-        atomic_write_json(config.session_map_file, session_map)
-        logger.info(
-            "Cleaned up %d stale session_map entries (windows no longer in tmux)",
-            len(stale_keys),
-        )
+        if await asyncio.to_thread(self._mutate_session_map_locked, mutate):
+            logger.info(
+                "Cleaned up stale session_map entries (windows no longer in tmux)"
+            )
 
     # --- Display name management ---
 
@@ -635,6 +725,22 @@ class SessionManager:
             return
 
         prefix = f"{config.tmux_session_name}:"
+
+        # Self-heal old-format keys (session:window_name) that an outdated hook
+        # may write at runtime: resolve them against live windows and rewrite to
+        # @window_id in place, so the delivery loop below can see them. Only
+        # lists tmux windows when such keys are actually present (zero cost in
+        # steady state). Mirrors the tolerance already in _load_current_session_map.
+        if any(
+            k.startswith(prefix) and not self._is_window_id(k[len(prefix) :])
+            for k in session_map
+        ):
+            windows = await tmux_manager.list_windows()
+            live_by_name = {w.window_name: w.window_id for w in windows}
+            if self._migrate_old_format_map(session_map, live_by_name):
+                atomic_write_json(config.session_map_file, session_map)
+                logger.info("Migrated old-format session_map keys during load")
+
         valid_wids: set[str] = set()
         changed = False
 
@@ -946,8 +1052,12 @@ class SessionManager:
         """
         result: list[tuple[int, str, int]] = []
         for user_id, thread_id, window_id in self.iter_thread_bindings():
-            resolved = await self.resolve_session_for_window(window_id)
-            if resolved and resolved.session_id == session_id:
+            # In-memory lookup only: window_states carries the authoritative
+            # window→session mapping (synced from session_map each poll cycle).
+            # Reading the JSONL here (resolve_session_for_window) would be
+            # O(bindings × file size) on every incoming message.
+            state = self.window_states.get(window_id)
+            if state and state.session_id == session_id:
                 result.append((user_id, window_id, thread_id))
         return result
 

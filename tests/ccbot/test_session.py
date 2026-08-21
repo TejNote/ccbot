@@ -1,5 +1,7 @@
 """Tests for SessionManager pure dict operations."""
 
+import json
+
 import pytest
 
 from ccbot.session import SessionManager, WindowState

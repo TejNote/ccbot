@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import subprocess
 from dataclasses import dataclass
@@ -25,6 +26,11 @@ import libtmux
 from .config import SENSITIVE_ENV_VARS, config
 
 logger = logging.getLogger(__name__)
+
+# Claude session IDs are UUIDs (JSONL filename stems)
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 
 @dataclass
@@ -466,6 +472,13 @@ class TmuxManager:
             return False, f"Directory does not exist: {work_dir}", "", ""
         if not path.is_dir():
             return False, f"Not a directory: {work_dir}", "", ""
+
+        # resume_session_id is interpolated into a shell command line below;
+        # it comes from JSONL filenames on disk, but validate defensively —
+        # Claude session IDs are always UUIDs.
+        if resume_session_id and not _UUID_RE.fullmatch(resume_session_id):
+            logger.error("Rejecting non-UUID resume_session_id: %r", resume_session_id)
+            return False, "Invalid session ID for resume", "", ""
 
         # Create window name, adding suffix if name already exists
         final_window_name = window_name if window_name else path.name

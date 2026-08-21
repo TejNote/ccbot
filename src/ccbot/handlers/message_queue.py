@@ -223,6 +223,48 @@ async def _merge_content_tasks(
     )
 
 
+async def _process_content_with_retry(
+    bot: Bot, user_id: int, task: MessageTask, max_attempts: int = 3
+) -> None:
+    """Send a content task, retrying across RetryAfter (flood control).
+
+    Content is actual Claude output — unlike ephemeral status updates it must
+    not be dropped just because a 429 bubbled past AIORateLimiter's retries.
+    Retrying re-runs the whole task, so parts already sent before the 429 may
+    be duplicated; duplication is preferred over losing output.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await _process_content_task(bot, user_id, task)
+            return
+        except RetryAfter as e:
+            retry_secs = (
+                e.retry_after
+                if isinstance(e.retry_after, int)
+                else int(e.retry_after.total_seconds())
+            )
+            if retry_secs > FLOOD_CONTROL_MAX_WAIT:
+                # Long ban — also pause subsequent queued tasks
+                _flood_until[user_id] = time.monotonic() + retry_secs
+            if attempt >= max_attempts:
+                logger.error(
+                    "Dropping content message for user %d after %d flood-control "
+                    "retries (retry_after=%ds)",
+                    user_id,
+                    max_attempts,
+                    retry_secs,
+                )
+                return
+            logger.warning(
+                "Flood control for user %d: retrying content in %ds (attempt %d/%d)",
+                user_id,
+                retry_secs,
+                attempt,
+                max_attempts,
+            )
+            await asyncio.sleep(retry_secs)
+
+
 async def _message_queue_worker(bot: Bot, user_id: int) -> None:
     """Process message tasks for a user sequentially."""
     queue = _message_queues[user_id]
@@ -267,7 +309,7 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                         # Mark merged tasks as done
                         for _ in range(merge_count):
                             queue.task_done()
-                    await _process_content_task(bot, user_id, merged_task)
+                    await _process_content_with_retry(bot, user_id, merged_task)
                 elif task.task_type == "status_update":
                     await _process_status_update_task(bot, user_id, task)
                 elif task.task_type == "status_clear":

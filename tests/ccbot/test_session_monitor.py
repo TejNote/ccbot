@@ -75,6 +75,59 @@ class TestReadNewLinesOffsetRecovery:
         assert session.last_byte_offset == jsonl_file.stat().st_size
 
     @pytest.mark.asyncio
+    async def test_poison_line_skipped(self, monitor, tmp_path, make_jsonl_entry):
+        """A complete (newline-terminated) but corrupt line must be skipped.
+
+        Regression: previously any unparseable line was treated as a partial
+        write and retried forever, permanently stalling the session.
+        """
+        jsonl_file = tmp_path / "session.jsonl"
+        good = make_jsonl_entry(msg_type="assistant", content="ok")
+        jsonl_file.write_text(
+            json.dumps(good) + "\n" + "{corrupt json!!!\n" + json.dumps(good) + "\n",
+            encoding="utf-8",
+        )
+        session = TrackedSession(
+            session_id="test-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        result = await monitor._read_new_lines(session, jsonl_file)
+
+        # Both good lines returned; offset advanced past the poison line
+        assert len(result) == 2
+        assert session.last_byte_offset == jsonl_file.stat().st_size
+
+    @pytest.mark.asyncio
+    async def test_partial_line_at_eof_retried(
+        self, monitor, tmp_path, make_jsonl_entry
+    ):
+        """An unterminated line at EOF is a partial write — retry next cycle."""
+        jsonl_file = tmp_path / "session.jsonl"
+        good = make_jsonl_entry(msg_type="assistant", content="ok")
+        good_line = json.dumps(good) + "\n"
+        jsonl_file.write_text(good_line + '{"type": "assis', encoding="utf-8")
+        session = TrackedSession(
+            session_id="test-session",
+            file_path=str(jsonl_file),
+            last_byte_offset=0,
+        )
+
+        result = await monitor._read_new_lines(session, jsonl_file)
+
+        assert len(result) == 1
+        # Offset stops at the partial line, not EOF
+        assert session.last_byte_offset == len(good_line.encode("utf-8"))
+
+        # Writer completes the line — next cycle picks it up
+        with open(jsonl_file, "a", encoding="utf-8") as f:
+            f.write('tant", "message": {"content": "done"}}\n')
+        result2 = await monitor._read_new_lines(session, jsonl_file)
+        assert len(result2) == 1
+        assert session.last_byte_offset == jsonl_file.stat().st_size
+
+    @pytest.mark.asyncio
     async def test_truncation_detection(self, monitor, tmp_path, make_jsonl_entry):
         """Detect file truncation and reset offset."""
         jsonl_file = tmp_path / "session.jsonl"

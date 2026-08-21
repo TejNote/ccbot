@@ -196,7 +196,10 @@ async def send_history(
             else:
                 lines.append(msg_text)
         full_text = "\n\n".join(lines)
-        pages = split_message(full_text, max_length=4096)
+        # Conservative page size (matches the real-time path): MarkdownV2
+        # escaping in safe_edit/safe_send can nearly double the text, so a
+        # 4096 page would overflow Telegram's limit after conversion.
+        pages = split_message(full_text, max_length=3000)
 
         # Default to last page (newest messages) for both history and unread
         if offset < 0:

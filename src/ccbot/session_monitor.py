@@ -246,8 +246,10 @@ class SessionMonitor:
 
                 # Read only new lines from the offset.
                 # Track safe_offset: only advance past lines that parsed
-                # successfully. A non-empty line that fails JSON parsing is
-                # likely a partial write; stop and retry next cycle.
+                # successfully. A non-empty line without a trailing newline is
+                # a partial write at EOF — retry next cycle. A COMPLETE line
+                # (newline-terminated) that fails to parse is permanently
+                # corrupt; skip it, or it would stall this session forever.
                 safe_offset = session.last_byte_offset
                 async for line in f:
                     data = TranscriptParser.parse_line(line)
@@ -255,12 +257,22 @@ class SessionMonitor:
                         new_entries.append(data)
                         safe_offset = await f.tell()
                     elif line.strip():
-                        # Partial JSONL line — don't advance offset past it
-                        logger.warning(
-                            "Partial JSONL line in session %s, will retry next cycle",
-                            session.session_id,
-                        )
-                        break
+                        if line.endswith("\n"):
+                            logger.warning(
+                                "Skipping unparseable JSONL line in session %s "
+                                "(%d bytes)",
+                                session.session_id,
+                                len(line),
+                            )
+                            safe_offset = await f.tell()
+                        else:
+                            # Partial write at EOF — don't advance offset
+                            logger.debug(
+                                "Partial JSONL line in session %s, "
+                                "will retry next cycle",
+                                session.session_id,
+                            )
+                            break
                     else:
                         # Empty line — safe to skip
                         safe_offset = await f.tell()

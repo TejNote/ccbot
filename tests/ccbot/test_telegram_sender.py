@@ -2,7 +2,7 @@
 
 import pytest
 
-from ccbot.telegram_sender import split_message
+from ccbot.telegram_sender import split_message, utf16_len
 
 
 class TestSplitMessage:
@@ -114,3 +114,62 @@ class TestSplitMessage:
         for chunk in chunks:
             fence_count = chunk.count("```")
             assert fence_count % 2 == 0, f"Unbalanced fences in: {chunk!r}"
+
+
+class TestUtf16Len:
+    """Telegram counts message length in UTF-16 code units, not code points."""
+
+    def test_ascii(self):
+        assert utf16_len("hello") == 5
+
+    def test_bmp_cjk(self):
+        # CJK in the BMP is one UTF-16 unit per character
+        assert utf16_len("中文") == 2
+
+    def test_emoji_counts_double(self):
+        # Non-BMP characters (surrogate pairs) count as two units
+        assert utf16_len("😀") == 2
+        assert utf16_len("a😀b") == 4
+
+
+class TestSplitMessageUtf16:
+    """split_message must budget by UTF-16 units or emoji-heavy text
+    exceeds Telegram's real limit and the send fails."""
+
+    def test_emoji_text_within_utf16_budget(self):
+        # 3000 emoji = 3000 code points but 6000 UTF-16 units
+        text = "😀" * 3000
+        chunks = split_message(text, max_length=4096)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert utf16_len(chunk) <= 4096
+
+    def test_emoji_lines_within_utf16_budget(self):
+        lines = ["😀" * 50 for _ in range(200)]
+        text = "\n".join(lines)
+        chunks = split_message(text, max_length=500)
+        for chunk in chunks:
+            assert utf16_len(chunk) <= 500
+
+    def test_force_split_never_splits_surrogate_pair(self):
+        # An odd budget with 2-unit chars: pieces must stay whole characters
+        text = "😀" * 100
+        chunks = split_message(text, max_length=51)
+        for chunk in chunks:
+            assert utf16_len(chunk) <= 51
+            # Round-trip through UTF-16 must not raise (no lone surrogates)
+            chunk.encode("utf-16")
+
+
+class TestSplitMessageCodeBlockForceSplit:
+    """Overlong single lines inside a code block keep fence integrity."""
+
+    def test_long_line_in_code_block_gets_fenced_pieces(self):
+        long_line = "x" * 200
+        text = f"```js\n{long_line}\n```"
+        chunks = split_message(text, max_length=60)
+        for chunk in chunks:
+            assert chunk.count("```") % 2 == 0, f"Unbalanced fences in: {chunk!r}"
+            assert utf16_len(chunk) <= 60
+        # The forced pieces are wrapped as standalone code blocks
+        assert any(c.startswith("```js\nx") and c.endswith("```") for c in chunks)

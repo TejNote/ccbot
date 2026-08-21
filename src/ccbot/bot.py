@@ -676,7 +676,10 @@ async def forward_command_handler(
     logger.info(
         "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
     )
-    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        await update.message.chat.send_action(ChatAction.TYPING)
+    except Exception as e:
+        logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     success, message = await session_manager.send_to_window(wid, cc_slash)
     if success:
         chat_id = chat.id if chat else user.id
@@ -782,7 +785,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         text_to_send = f"(image attached: {file_path})"
 
-    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        await update.message.chat.send_action(ChatAction.TYPING)
+    except Exception as e:
+        logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     clear_status_msg_info(user.id, thread_id)
 
     success, message = await session_manager.send_to_window(wid, text_to_send)
@@ -866,7 +872,10 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(update.message, f"⚠ Transcription failed: {e}")
         return
 
-    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        await update.message.chat.send_action(ChatAction.TYPING)
+    except Exception as e:
+        logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
     clear_status_msg_info(user.id, thread_id)
 
     success, message = await session_manager.send_to_window(wid, text)
@@ -1124,25 +1133,43 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    await update.message.chat.send_action(ChatAction.TYPING)
-    await enqueue_status_update(context.bot, user.id, wid, None, thread_id=thread_id)
+    # Cosmetic / outbound-Telegram steps below must NEVER abort the handler
+    # before the message is injected into tmux. On flaky networks the "typing…"
+    # indicator (send_action) and status enqueue time out (telegram.error.TimedOut);
+    # since the update offset has already advanced, Telegram won't redeliver, so
+    # any exception here silently drops the user's message and forces a resend.
+    try:
+        await update.message.chat.send_action(ChatAction.TYPING)
+    except Exception as e:
+        logger.warning("send_action(TYPING) failed, continuing to injection: %s", e)
+    try:
+        await enqueue_status_update(
+            context.bot, user.id, wid, None, thread_id=thread_id
+        )
+    except Exception as e:
+        logger.warning("enqueue_status_update failed, continuing to injection: %s", e)
 
     # Cancel any running bash capture — new message pushes pane content down
     _cancel_bash_capture(user.id, thread_id)
 
     # Check for pending interactive UI before sending text.
     # This catches UIs (permission prompts, etc.) that status polling might have missed.
-    pane_text = await tmux_manager.capture_pane(w.window_id)
-    if pane_text and is_interactive_ui(pane_text):
-        # UI detected — show it to user, then send text (acts as Enter)
-        logger.info(
-            "Detected pending interactive UI before sending text (user=%d, thread=%s)",
-            user.id,
-            thread_id,
-        )
-        await handle_interactive_ui(context.bot, user.id, wid, thread_id)
-        # Small delay to let UI render in Telegram before text arrives
-        await asyncio.sleep(0.3)
+    # capture_pane is a local tmux call, but handle_interactive_ui hits the network —
+    # isolate the whole block so a failure can't prevent the injection below.
+    try:
+        pane_text = await tmux_manager.capture_pane(w.window_id)
+        if pane_text and is_interactive_ui(pane_text):
+            # UI detected — show it to user, then send text (acts as Enter)
+            logger.info(
+                "Detected pending interactive UI before sending text (user=%d, thread=%s)",
+                user.id,
+                thread_id,
+            )
+            await handle_interactive_ui(context.bot, user.id, wid, thread_id)
+            # Small delay to let UI render in Telegram before text arrives
+            await asyncio.sleep(0.3)
+    except Exception as e:
+        logger.warning("interactive-UI precheck failed, continuing to injection: %s", e)
 
     success, message = await session_manager.send_to_window(wid, text)
     if not success:
@@ -1205,14 +1232,16 @@ async def _create_and_bind_window(
             created_wid, timeout=hook_timeout
         )
 
-        # --resume creates a new session_id in the hook, but messages continue
-        # writing to the resumed session's JSONL file. Override window_state to
-        # track the original session_id so the monitor can route messages back.
+        # --resume: messages keep writing to the resumed session's JSONL, and
+        # current Claude Code reports the original session_id in the
+        # SessionStart hook (source="resume"), so normally nothing to fix up.
+        # If the hook timed out or reported a different id (older CC versions),
+        # force both window_state AND session_map to the resumed id —
+        # session_map drives the monitor's watch list, and load_session_map()
+        # would revert a window_state-only override on the next poll cycle.
         if resume_session_id:
             ws = session_manager.get_window_state(created_wid)
             if not hook_ok:
-                # Hook timed out — manually populate window_state so the
-                # monitor can still route messages back to this topic.
                 logger.warning(
                     "Hook timed out for resume window %s, "
                     "manually setting session_id=%s cwd=%s",
@@ -1233,6 +1262,12 @@ async def _create_and_bind_window(
                 )
                 ws.session_id = resume_session_id
                 session_manager._save_state()
+            await session_manager.override_session_map_entry(
+                created_wid,
+                resume_session_id,
+                cwd=str(selected_path),
+                window_name=created_wname,
+            )
 
         if pending_thread_id is not None:
             # Thread bind flow: bind thread to newly created window
@@ -1267,6 +1302,9 @@ async def _create_and_bind_window(
                 )
                 if not send_ok:
                     logger.warning("Failed to forward pending text: %s", send_msg)
+                    resolved_chat = session_manager.resolve_chat_id(
+                        user.id, pending_thread_id
+                    )
                     await safe_send(
                         context.bot,
                         resolved_chat,
@@ -1645,6 +1683,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             if not send_ok:
                 logger.warning("Failed to forward pending text: %s", send_msg)
+                resolved_chat = session_manager.resolve_chat_id(user.id, thread_id)
                 await safe_send(
                     context.bot,
                     resolved_chat,

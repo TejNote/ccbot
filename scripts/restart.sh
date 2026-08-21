@@ -18,11 +18,10 @@ if ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep
     exit 1
 fi
 
-# Get the pane PID and check if uv run ccbot is running
-PANE_PID=$(tmux list-panes -t "$TARGET" -F '#{pane_pid}')
-
+# Check if uv run ccbot is running. Uses pgrep (portable across macOS/Linux)
+# instead of pstree, which is not installed on macOS by default.
 is_ccbot_running() {
-    pstree -a "$PANE_PID" 2>/dev/null | grep -q 'uv.*run ccbot\|ccbot.*\.venv/bin/ccbot'
+    pgrep -f 'uv run ccbot|\.venv/bin/ccbot' >/dev/null 2>&1
 }
 
 # Stop existing process if running
@@ -40,8 +39,8 @@ if is_ccbot_running; then
 
     if is_ccbot_running; then
         echo "Process did not exit after ${MAX_WAIT}s, sending SIGTERM..."
-        # Kill the uv process directly
-        UV_PID=$(pstree -ap "$PANE_PID" 2>/dev/null | grep -oP 'uv,\K\d+' | head -1)
+        # Kill the uv wrapper directly (pgrep is portable across macOS/Linux)
+        UV_PID=$(pgrep -f 'uv run ccbot' | head -1)
         if [ -n "$UV_PID" ]; then
             kill "$UV_PID" 2>/dev/null || true
             sleep 2

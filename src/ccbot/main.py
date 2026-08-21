@@ -31,15 +31,20 @@ def main() -> None:
         # means a typo (or `ccbot --help`) launches a second bot instance
         # that races the real one for Telegram updates.
         usage = (
-            "Usage: ccbot        start the Telegram bot\n"
-            "       ccbot hook   run as Claude Code SessionStart hook\n"
-            "       ccbot send   send a message to a session (this fork)"
+            "Usage: ccbot [start]  start the Telegram bot\n"
+            "       ccbot hook     run as Claude Code SessionStart hook\n"
+            "       ccbot send     send a message to a session (this fork)"
         )
         if sys.argv[1] in ("-h", "--help"):
             print(usage)
             return
-        print(f"Unknown argument: {sys.argv[1]}\n{usage}", file=sys.stderr)
-        sys.exit(2)
+        # `start` 는 이 fork 런처의 명시적 별칭이다 — ccbot-start-real.sh:57 이
+        # `"$CCBOT_BIN" start` 로 부른다. upstream 은 bare `ccbot` 만 상정해 이걸
+        # "미지의 인자" 로 거부했고, 2026-08-21 upstream 머지 직후 봇이 exit 2 로
+        # 기동 실패해 launchd 가 재시도 루프에 들어갔다. 거부에서 예외로 둔다.
+        if sys.argv[1] != "start":
+            print(f"Unknown argument: {sys.argv[1]}\n{usage}", file=sys.stderr)
+            sys.exit(2)
 
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

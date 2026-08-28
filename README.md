@@ -54,7 +54,7 @@ In fact, CCBot itself was built this way — iterating on itself through Claude 
 
 - **tmux** — must be installed and available in PATH
 - **Claude Code** — the CLI tool (`claude`) must be installed
-- **Codex / OMX** *(optional)* — required only if you want Codex windows routed; install [`omx`](https://github.com/) and the bundled `~/Documents/Claude/.omx/hooks/ccbot-bridge.mjs` plugin
+- **Codex / OMX** *(optional)* — required only if you want Codex windows routed; install [`omx`](https://github.com/) and add the `ccbot-bridge.mjs` hook plugin to your OMX hooks directory (not shipped in this repo)
 
 ## Installation
 
@@ -234,7 +234,7 @@ Windows named `codex` or `codex-*` are routed to OMX in `direct` mode. Set this 
 OMX_LAUNCH_POLICY=direct omx
 ```
 
-Status updates from Codex (`Working`, `Ran`, `Read`, `Edit`, etc.) flow through the same Telegram pipeline as Claude. The `ccbot-bridge.mjs` OMX hook plugin (at `~/Documents/Claude/.omx/hooks/`) emits assistant responses back to the topic via `ccbot send`.
+Status updates from Codex (`Working`, `Ran`, `Read`, `Edit`, etc.) flow through the same Telegram pipeline as Claude. The `ccbot-bridge.mjs` OMX hook plugin (installed into your OMX hooks directory) emits assistant responses back to the topic via `ccbot send`.
 
 **Killing a session:**
 

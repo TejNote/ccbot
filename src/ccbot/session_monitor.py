@@ -98,6 +98,12 @@ class SessionMonitor:
         #     그래서 시각이 아니라 **되돌아감 금지**로 막는다. /clear 는 한 번만 갈아타면
         #     되므로 그 기능은 그대로 살고, 왕복은 원리적으로 불가능해진다.
         self._abandoned_sids: dict[str, set[str]] = {}  # window_key -> 버린 sid 들
+        # 우리가 auto-detect 로 채택한 sid. 현재 값이 이것과 다르면 훅·세션 피커가
+        # 명시적으로 바꾼 것이므로, 그 창의 «버린 세션» 기억을 비운다(의도된 전환은 늘 통한다).
+        self._adopted_sids: dict[str, str] = {}   # window_key -> 우리가 채택한 sid
+        # 재채택 거부 경고를 창·후보 조합당 한 번만 낸다 — 폴링이 2초라 그냥 두면
+        # 유휴 상태에서도 영원히 같은 경고가 찍힌다(2026-08-31 리뷰 지적).
+        self._warned_readopt: set[tuple[str, str]] = set()
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -479,6 +485,17 @@ class SessionMonitor:
                 old_session_id,
             )
             sessions_to_remove.add(old_session_id)
+            # auto-detect 쪽 창별 상태도 같이 버린다. tmux 창 ID(@N)는 재사용되므로
+            # 남겨두면 새 창이 옛 창의 «버린 세션» 기억을 물려받는다.
+            # ⚠️ 이 dict 들의 키는 «ccbot:@N» 전체다(_load_current_session_map 은
+            #    prefix 를 떼고 @N 만 준다). 재구성하지 않으면 pop 이 조용히 no-op 이 된다.
+            full_key = f"{config.tmux_session_name}:{window_id}"
+            self._abandoned_sids.pop(full_key, None)
+            self._adopted_sids.pop(full_key, None)
+            self._auto_detect_mtimes.pop(full_key, None)
+            self._warned_readopt = {
+                t for t in self._warned_readopt if t[0] != full_key
+            }
 
         # Perform cleanup
         if sessions_to_remove:
@@ -520,6 +537,16 @@ class SessionMonitor:
             current_sid = info.get("session_id", "")
             if not cwd or not current_sid:
                 continue
+
+            # 현재 값이 «우리가 채택한 것» 과 다르면 훅이나 세션 피커가 명시적으로 바꿨다.
+            # 그건 의도된 전환이므로 이 창의 되돌아가기-금지 기억을 비운다.
+            # 없으면: 창 안에서 직접 /resume 했는데 훅이 실패한 경우, 과거에 한 번 버려진
+            # 세션이면 영구히 재채택이 거부돼 **아무 신호 없이 대화가 멈춘 것처럼 보인다.**
+            adopted = self._adopted_sids.get(key)
+            if adopted is not None and current_sid != adopted:
+                self._abandoned_sids.pop(key, None)
+                self._adopted_sids.pop(key, None)
+                self._warned_readopt = {t for t in self._warned_readopt if t[0] != key}
 
             # cwd → project dir (same convention as ~/.claude/projects/)
             project_dir = self.projects_path / ("-" + cwd.strip("/").replace("/", "-"))
@@ -563,6 +590,13 @@ class SessionMonitor:
                 if newest_sid in self._abandoned_sids.get(key, set()):
                     # 이 창에서 이미 버린 세션이다. 되돌아가면 왕복이 시작된다 —
                     # 같은 cwd 에 세션이 둘 이상 살아 있다는 신호이므로 사유를 남긴다.
+                    # ⚠️ 조합당 한 번만 경고한다. 이 분기는 추적 파일이 안 자라는 동안
+                    #    **매 폴링(2초)** 마다 다시 도달하므로, 그냥 두면 유휴 상태에서도
+                    #    같은 경고가 무한히 쌓인다(2026-08-31 리뷰 지적).
+                    warned = (key, newest_sid)
+                    if warned in self._warned_readopt:
+                        continue
+                    self._warned_readopt.add(warned)
                     logger.warning(
                         "Refusing to re-adopt abandoned session for %s: %s (cwd=%s). "
                         "같은 cwd 에 살아 있는 세션이 둘 이상이다 — 코드 작업은 "
@@ -579,6 +613,7 @@ class SessionMonitor:
                     newest_sid,
                 )
                 self._abandoned_sids.setdefault(key, set()).add(current_sid)
+                self._adopted_sids[key] = newest_sid
                 info["session_id"] = newest_sid
                 changed = True
 

@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -30,6 +31,20 @@ from .utils import read_cwd_from_jsonl
 logger = logging.getLogger(__name__)
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# --- _auto_detect_session_changes 의 시간 임계값 ---
+# 훅·세션 피커가 방금 등록한 세션은 jsonl 이 아직 없다. 그 사이에 «낡았다» 로 보고
+# 갈아타면 살아 있는 세션을 버리므로, 파일이 생길 때까지 이만큼 기다린다.
+NEW_SESSION_GRACE_SEC = 120.0
+# 재채택 거부가 이만큼 이어지면 우리 판단을 의심한다(아래 두 조건이 함께 성립할 때만).
+READOPT_FORCE_AFTER_SEC = 600.0
+# 추적 중인 세션이 이만큼 안 자라면 죽은 것으로 본다.
+CURRENT_DEAD_AFTER_SEC = 300.0
+# 후보가 이 안에 자랐으면 살아 있는 것으로 본다.
+CANDIDATE_ALIVE_WITHIN_SEC = 180.0
+# 같은 경고를 이 주기로만 반복한다. 폴링이 2초라 무제한이면 로그가 쌓이고,
+# 「한 번만」이면 반대로 오래 갇힌 상태가 사실상 안 보인다(둘 다 겪었다).
+REWARN_SEC = 600.0
 
 
 @dataclass
@@ -88,7 +103,9 @@ class SessionMonitor:
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
         # Cache for auto-detect: skip dir scan when tracked JSONL is actively growing
-        self._auto_detect_mtimes: dict[str, float] = {}  # window_key -> last_seen_mtime
+        # 🚨 키는 (window_key, sid) 다. 창 키만 쓰면 «앞 세션» 의 mtime 과 비교하게 되고,
+        #    훅이 방금 등록한 새 세션의 첫 폴링이 곧바로 «낡았다» 로 판정된다.
+        self._auto_detect_mtimes: dict[tuple[str, str], float] = {}
         # 한 번 갈아타며 버린 session_id 를 창별로 기억한다 — 되돌아가지 않기 위해서다.
         # 왜: _auto_detect_session_changes 는 cwd 하나에 세션 하나를 전제한다. 같은 cwd 에
         #     살아 있는 세션이 둘이면 방금 입력한 쪽이 계속 «최신» 이 되어 session_map 이
@@ -97,13 +114,28 @@ class SessionMonitor:
         #     둘 다 «옛 파일이 방금까지 자랐고 새 파일이 자란다» 로 똑같이 보인다.
         #     그래서 시각이 아니라 **되돌아감 금지**로 막는다. /clear 는 한 번만 갈아타면
         #     되므로 그 기능은 그대로 살고, 왕복은 원리적으로 불가능해진다.
+        # ⚠️ 단 예외가 하나 있다 — `_suspect_abandoned` 의 자기 치유다. 「우리가 버린 게
+        #    아니라 훅이 등록해 둔 세션을 버린」 경우에 한해, 연속 거부가 이어지면 되돌아간다.
+        #    그 좁은 구멍이 없으면 살아 있는 세션을 버린 실수가 영구화된다(2026-09-02 사고).
         self._abandoned_sids: dict[str, set[str]] = {}  # window_key -> 버린 sid 들
         # 우리가 auto-detect 로 채택한 sid. 현재 값이 이것과 다르면 훅·세션 피커가
         # 명시적으로 바꾼 것이므로, 그 창의 «버린 세션» 기억을 비운다(의도된 전환은 늘 통한다).
-        self._adopted_sids: dict[str, str] = {}   # window_key -> 우리가 채택한 sid
+        self._adopted_sids: dict[str, str] = {}  # window_key -> 우리가 채택한 sid
         # 재채택 거부 경고를 창·후보 조합당 한 번만 낸다 — 폴링이 2초라 그냥 두면
         # 유휴 상태에서도 영원히 같은 경고가 찍힌다(2026-08-31 리뷰 지적).
-        self._warned_readopt: set[tuple[str, str]] = set()
+        # «우리가 채택한 적 없는» sid 를 버린 경우만 여기 담는다 = 훅·세션 피커가
+        # 등록해 둔 것을 우리가 덮은 것이므로, 우리 판단이 틀렸을 수 있는 후보다.
+        # 🚨 자기 치유는 이 집합만 대상으로 한다. 우리가 스스로 채택했다가 버린 sid 로는
+        #    절대 되돌아가지 않는다 — 그러면 왕복이 되살아난다(리뷰 지적, 실측 재현됨:
+        #    살아 있지만 5분 조용한 세션에서 946초 만에 튀었다).
+        self._suspect_abandoned: dict[str, set[str]] = {}
+        # 경고를 마지막으로 낸 시각(창·후보 조합별). 값이 시각인 이유는 위 REWARN_SEC 참고.
+        self._warned_readopt: dict[tuple[str, str], float] = {}
+        # (창, sid) 를 session_map 에서 처음 본 시각. jsonl 이 아직 없는 새 세션에
+        # 유예를 주기 위한 기준점이다.
+        self._sid_first_seen: dict[tuple[str, str], float] = {}
+        # 재채택을 처음 거부한 시각(창·후보 조합별). 자기 치유의 기준점이다.
+        self._refused_since: dict[tuple[str, str], float] = {}
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -491,10 +523,20 @@ class SessionMonitor:
             #    prefix 를 떼고 @N 만 준다). 재구성하지 않으면 pop 이 조용히 no-op 이 된다.
             full_key = f"{config.tmux_session_name}:{window_id}"
             self._abandoned_sids.pop(full_key, None)
+            self._suspect_abandoned.pop(full_key, None)
             self._adopted_sids.pop(full_key, None)
-            self._auto_detect_mtimes.pop(full_key, None)
+            # ⚠️ 아래 셋은 키가 (창, sid) 튜플이다 — pop 이 아니라 창 기준으로 걸러낸다.
+            self._auto_detect_mtimes = {
+                k: v for k, v in self._auto_detect_mtimes.items() if k[0] != full_key
+            }
+            self._sid_first_seen = {
+                k: v for k, v in self._sid_first_seen.items() if k[0] != full_key
+            }
+            self._refused_since = {
+                k: v for k, v in self._refused_since.items() if k[0] != full_key
+            }
             self._warned_readopt = {
-                t for t in self._warned_readopt if t[0] != full_key
+                k: v for k, v in self._warned_readopt.items() if k[0] != full_key
             }
 
         # Perform cleanup
@@ -509,12 +551,54 @@ class SessionMonitor:
 
         return current_map
 
+    def _warn_periodically(
+        self, wkey: tuple[str, str], now: float, msg: str, *args: object
+    ) -> None:
+        """같은 경고를 `REWARN_SEC` 주기로만 낸다.
+
+        이 함수가 있는 이유는 두 번의 과잉 교정 때문이다 — 폴링이 2초라 무제한으로
+        찍으면 유휴 상태에서도 로그가 무한히 쌓이고(2026-08-31), 「조합당 한 번만」
+        찍으면 오래 갇힌 상태가 사실상 안 보인다(2026-09-03). 주기 재경고가 답이다.
+        """
+        last = self._warned_readopt.get(wkey, 0.0)
+        if now - last < REWARN_SEC:
+            return
+        self._warned_readopt[wkey] = now
+        logger.warning(msg, *args)
+
+    def _prune_window_sid_state(self, key: str, keep_sid: str) -> None:
+        """창 하나에 대해 «지금 추적하는 sid» 것만 남긴다.
+
+        `_auto_detect_mtimes`·`_sid_first_seen` 은 키가 (창, sid) 다. 창은 그대로인데
+        sid 는 `/clear` 마다 바뀌므로, 안 버리면 세션 교체마다 한 칸씩 쌓인다.
+        읽을 때는 언제나 현재 sid 것만 보므로 나머지는 버려도 안전하다.
+        """
+        self._auto_detect_mtimes = {
+            k: v
+            for k, v in self._auto_detect_mtimes.items()
+            if k[0] != key or k[1] == keep_sid
+        }
+        self._sid_first_seen = {
+            k: v
+            for k, v in self._sid_first_seen.items()
+            if k[0] != key or k[1] == keep_sid
+        }
+
     async def _auto_detect_session_changes(self) -> bool:
         """Detect session_id changes not caught by hook (e.g., /clear).
 
         For each window in session_map, check if a newer main JSONL exists
         in the project directory. If found, update session_map.json so the
         monitor picks up the new session automatically.
+
+        갈아타기에는 가드가 셋 있다.
+          1. **새 세션 유예** — 훅이 방금 등록해 jsonl 이 아직 없는 세션은 건드리지 않는다.
+          2. **되돌아가기 금지** — 한 번 버린 sid 로는 돌아가지 않는다(왕복 방지).
+          3. **자기 치유** — 단, 2번 때문에 살아 있는 세션을 영구히 놓친 상태가 감지되면
+             (추적 중인 쪽은 죽었고 후보만 자란다) 시간을 두고 강제로 되돌린다.
+             3번이 2번을 무력화하지 않도록 가드가 둘이다 — 「훅이 등록해 둔 것을 우리가
+             덮은」 후보만 대상으로 하고(`_suspect_abandoned`), 거부 시계는 추적 파일이
+             자랄 때마다 리셋해 「연속」 거부만 센다.
         """
         if not config.session_map_file.exists():
             return False
@@ -545,28 +629,74 @@ class SessionMonitor:
             adopted = self._adopted_sids.get(key)
             if adopted is not None and current_sid != adopted:
                 self._abandoned_sids.pop(key, None)
+                self._suspect_abandoned.pop(key, None)
                 self._adopted_sids.pop(key, None)
-                self._warned_readopt = {t for t in self._warned_readopt if t[0] != key}
+                self._warned_readopt = {
+                    k: v for k, v in self._warned_readopt.items() if k[0] != key
+                }
+                self._refused_since = {
+                    k: v for k, v in self._refused_since.items() if k[0] != key
+                }
 
             # cwd → project dir (same convention as ~/.claude/projects/)
             project_dir = self.projects_path / ("-" + cwd.strip("/").replace("/", "-"))
             if not project_dir.exists():
                 continue
 
-            # Current tracked JSONL mtime
+            now = time.time()
+            mkey = (key, current_sid)
+            self._prune_window_sid_state(key, current_sid)
+            first_seen = self._sid_first_seen.setdefault(mkey, now)
+
+            # Current tracked JSONL mtime.
+            # ⚠️ «파일이 없다» 와 «stat 이 실패했다» 를 구분한다. 둘 다 0 으로 뭉개면
+            #    NFS 순단·권한 일시변경 같은 일시적 실패가 「낡았다」로 읽혀, 폴더의 더
+            #    오래된 jsonl 조차 «더 최신» 으로 오판돼 **멀쩡한 세션이 교체된다.**
+            #    그러면 정상 교체 INFO 만 남아 원인 흔적이 안 남는다(리뷰 지적).
             current_jsonl = project_dir / f"{current_sid}.jsonl"
             try:
                 current_mtime = (
-                    current_jsonl.stat().st_mtime if current_jsonl.exists() else 0
+                    current_jsonl.stat().st_mtime if current_jsonl.exists() else 0.0
                 )
-            except OSError:
-                current_mtime = 0
+            except OSError as e:
+                logger.debug(
+                    "stat 실패로 이번 폴링을 건너뛴다: %s (%s) — %s",
+                    current_jsonl,
+                    key,
+                    e,
+                )
+                continue
+
+            # 🚨 훅·세션 피커가 방금 등록한 세션은 jsonl 이 아직 만들어지지 않았다(mtime 0).
+            #    그걸 «낡았다» 로 보고 폴더 최신 파일로 갈아타면 **살아 있는 세션을 버린다.**
+            #    2026-09-02 16:41 @4 가 정확히 그랬다 — 훅이 쓴 e2586825 를 2ms 뒤 auto-detect
+            #    가 e1923ab1(직전 세션, 아직 flush 중)로 덮고 e2586825 를 abandoned 에 넣었다.
+            #    그 뒤 영구 거부돼 personal 토픽이 **23시간 동안 출력 0** 이었다. 수신은 창 ID
+            #    로 라우팅하니 정상이라, 「받기는 되는데 안 나온다」로만 보여 더 안 잡혔다.
+            if current_mtime == 0 and now - first_seen < NEW_SESSION_GRACE_SEC:
+                logger.debug(
+                    "%s: %s 의 jsonl 을 기다린다 (%.0f/%.0f초)",
+                    key,
+                    current_sid,
+                    now - first_seen,
+                    NEW_SESSION_GRACE_SEC,
+                )
+                continue
 
             # Skip dir scan if tracked JSONL is still actively growing
-            last_seen = self._auto_detect_mtimes.get(key, 0)
+            last_seen = self._auto_detect_mtimes.get(mkey, 0)
             if current_mtime > last_seen:
                 # File is growing → no need to scan for replacements
-                self._auto_detect_mtimes[key] = current_mtime
+                self._auto_detect_mtimes[mkey] = current_mtime
+                # 🚨 자란다 = 살아 있다. 「연속 거부」 시계를 여기서 리셋한다.
+                #    안 하면 `_refused_since` 가 «최초 거부 이후의 달력 시간» 이 되어,
+                #    그 사이 추적 세션이 몇 번이나 정상으로 자랐어도 누적된다. 그러면
+                #    자기 치유가 「10분간 계속 죽어 있었다」가 아니라 「10분 전에 한 번
+                #    거부된 적이 있고 지금 우연히 조용하다」로 발동한다 — 리뷰가 실측으로
+                #    재현했다(320초 주기로 살아 있던 세션에서 946초 만에 튐).
+                self._refused_since = {
+                    k: v for k, v in self._refused_since.items() if k[0] != key
+                }
                 continue
             # mtime unchanged → file is stale, scan for a newer session
 
@@ -586,36 +716,100 @@ class SessionMonitor:
                     newest_mtime = file_mtime
                     newest_sid = stem
 
-            if newest_sid and newest_sid != current_sid:
-                if newest_sid in self._abandoned_sids.get(key, set()):
-                    # 이 창에서 이미 버린 세션이다. 되돌아가면 왕복이 시작된다 —
-                    # 같은 cwd 에 세션이 둘 이상 살아 있다는 신호이므로 사유를 남긴다.
-                    # ⚠️ 조합당 한 번만 경고한다. 이 분기는 추적 파일이 안 자라는 동안
-                    #    **매 폴링(2초)** 마다 다시 도달하므로, 그냥 두면 유휴 상태에서도
-                    #    같은 경고가 무한히 쌓인다(2026-08-31 리뷰 지적).
-                    warned = (key, newest_sid)
-                    if warned in self._warned_readopt:
-                        continue
-                    self._warned_readopt.add(warned)
+            if not newest_sid or newest_sid == current_sid:
+                # 🚨 대체할 후보가 아예 없다. 추적 중인 세션의 jsonl 이 유예를 넘겨서도
+                #    안 생겼다면(훅이 틀린 cwd 를 등록·권한 문제 등) 이 창은 영원히
+                #    출력 0 인데, 예전에는 여기서 **로그 한 줄도 남지 않았다.** 사고와
+                #    같은 증상인데 원인 흔적이 없다 — 그래서 주기적으로 남긴다.
+                if current_mtime == 0:
+                    self._warn_periodically(
+                        (key, current_sid),
+                        now,
+                        "%s: 추적 중인 %s 의 jsonl 이 %.0f초째 없고 대체 후보도 없다 "
+                        "(cwd=%s). 이 토픽은 출력이 나가지 않는다 — 훅이 등록한 cwd 가 "
+                        "맞는지 확인한다.",
+                        key,
+                        current_sid,
+                        now - first_seen,
+                        cwd,
+                    )
+                continue
+
+            if newest_sid in self._abandoned_sids.get(key, set()):
+                # 이 창에서 이미 버린 세션이다. 되돌아가면 왕복이 시작된다 —
+                # 같은 cwd 에 세션이 둘 이상 살아 있다는 신호이므로 사유를 남긴다.
+                rkey = (key, newest_sid)
+                since = self._refused_since.setdefault(rkey, now)
+
+                # 🩹 자기 치유 — 「우리가 채택한 적 없는」 세션을 버렸고(= 훅이 등록해 둔
+                #    것을 우리가 덮었다), 그 뒤 **연속으로** 거부가 이어지는데 추적 중인
+                #    쪽은 죽었고 후보만 자란다면, 살아 있는 세션을 버렸던 것이다.
+                #    그냥 두면 그 토픽은 영원히 출력 0 이 된다(사고가 23시간 그 상태였다).
+                #
+                #    가드가 둘이다. 하나만으로는 왕복이 되살아난다 —
+                #    ① `_suspect_abandoned` — 우리가 스스로 채택했다 버린 sid 로는 절대
+                #       되돌아가지 않는다. 되돌아가면 그 다음엔 반대편이 후보가 되어
+                #       왕복이 성립한다
+                #    ② `_refused_since` 는 growing 분기에서 리셋된다(위 참고). 그래서
+                #       「연속 거부 10분」이고, 「10분 전에 한 번 거부됐다」가 아니다.
+                #       ②가 없으면 살아 있지만 5분 조용한 세션에서 튄다(실측 946초)
+                if (
+                    newest_sid in self._suspect_abandoned.get(key, set())
+                    and now - since >= READOPT_FORCE_AFTER_SEC
+                    and now - current_mtime >= CURRENT_DEAD_AFTER_SEC
+                    and now - newest_mtime <= CANDIDATE_ALIVE_WITHIN_SEC
+                ):
                     logger.warning(
+                        "Force re-adopting %s for %s (cwd=%s) — 연속 거부 %.0f초, "
+                        "추적 중인 %s 는 %.0f초째 안 자라는데 후보만 자란다. "
+                        "훅이 등록해 둔 살아 있는 세션을 버렸던 것으로 판단해 되돌린다.",
+                        newest_sid,
+                        key,
+                        cwd,
+                        now - since,
+                        current_sid,
+                        now - current_mtime,
+                    )
+                    self._abandoned_sids[key].discard(newest_sid)
+                    self._suspect_abandoned.get(key, set()).discard(newest_sid)
+                    self._refused_since.pop(rkey, None)
+                    self._warned_readopt.pop(rkey, None)
+                    # 아래 정상 채택 경로로 떨어진다
+                else:
+                    # ⚠️ 매 폴링(2초)마다 여기 도달하므로 그냥 두면 경고가 무한히 쌓인다
+                    #    (2026-08-31 리뷰). 반대로 「조합당 한 번만」은 오래 갇힌 상태를
+                    #    사실상 안 보이게 만든다(2026-09-03 리뷰). 그래서 주기 재경고다.
+                    self._warn_periodically(
+                        rkey,
+                        now,
                         "Refusing to re-adopt abandoned session for %s: %s (cwd=%s). "
-                        "같은 cwd 에 살아 있는 세션이 둘 이상이다 — 코드 작업은 "
-                        "워크트리처럼 cwd 를 분리해서 띄운다.",
+                        "연속 거부 %.0f초. 같은 cwd 에 살아 있는 세션이 둘 이상이다 — "
+                        "코드 작업은 워크트리처럼 cwd 를 분리해서 띄운다.",
                         key,
                         newest_sid,
                         cwd,
+                        now - since,
                     )
                     continue
-                logger.info(
-                    "Auto-detected session change for %s: %s -> %s",
-                    key,
-                    current_sid,
-                    newest_sid,
-                )
-                self._abandoned_sids.setdefault(key, set()).add(current_sid)
-                self._adopted_sids[key] = newest_sid
-                info["session_id"] = newest_sid
-                changed = True
+
+            logger.info(
+                "Auto-detected session change for %s: %s -> %s",
+                key,
+                current_sid,
+                newest_sid,
+            )
+            self._abandoned_sids.setdefault(key, set()).add(current_sid)
+            # «우리가 채택한 적 없는» 것을 버렸다면 우리 판단이 틀렸을 수 있다.
+            # 자기 치유는 이 경우만 되돌린다.
+            if self._adopted_sids.get(key) != current_sid:
+                self._suspect_abandoned.setdefault(key, set()).add(current_sid)
+            self._adopted_sids[key] = newest_sid
+            info["session_id"] = newest_sid
+            changed = True
+            # 창의 세션이 바뀌었으니 이 창의 거부 시계는 전부 무효다.
+            self._refused_since = {
+                k: v for k, v in self._refused_since.items() if k[0] != key
+            }
 
         if changed:
             try:

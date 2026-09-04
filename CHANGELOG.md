@@ -14,6 +14,32 @@
 
 ---
 
+## [1.0.10] - 2026-09-04
+
+libtmux 의 창·pane 열거를 우회해 `zip() argument 2 is shorter than argument 1` 을 없앤다.
+
+### Fixed
+
+- **libtmux 열거가 간헐적으로 터지던 문제** (`tmux_manager.py`, 8곳)
+  - libtmux 는 tmux 에 **126개 필드**를 `␞` 로 이어 달라고 하고 **출력을 줄 단위로** 레코드 하나로 본다. 어떤 필드 값에 개행이 들어가면(예: `pane_current_path` 가 개행 든 디렉터리) 레코드가 두 줄로 쪼개지고, `neo.py` 의 `zip(..., strict=True)` 가 `ValueError: zip() argument 2 is shorter than argument 1` 로 터진다 (운영이 쓰는 **0.55.1 기준 `neo.py:244`**, 최신 0.62.0 에서는 `neo.py:657` — 줄 번호는 버전마다 다르다)
+  - ⚠️ **개발 venv 와 운영이 서로 다른 libtmux 를 쓴다.** `pyproject.toml` 이 `libtmux>=0.37.0` 로 열려 있어 새로 만든 venv 는 0.62.0 을 받고, 실제 봇(uv tool)은 0.55.1 이다 — 테스트는 다른 버전 위에서 돈다. 별건으로 남긴다
+  - **upstream libtmux #752 로 보고돼 있고 PR 미머지다** — 우리 0.55.1 부터 최신 0.62.0 까지 전부 영향. 그래서 버전 업그레이드로는 안 고쳐진다
+  - 간헐적인 이유도 이슈가 설명한다 — 「blast radius moves with the active pane」. 세션·창 행이 `pane_*` 를 활성 pane 기준으로 해석하므로, 어느 pane 이 활성인지에 따라 성공/실패가 오간다. 실측: 09-02~09-04 사흘 **11건**, 창 `@0`~`@5` 에 흩어져 발생
+  - 🚨 피해가 상태줄 갱신에서 끝나지 않았다 — **텔레그램 → tmux 주입도 같은 열거를 탄다**(`send_keys`·`_send_via_paste`). 개행 든 값이 지속되면 메시지 전달이 막힌다
+  - 수정 — `session.windows.get(...)` → `active_pane` 경로를 쓰던 **8곳** + **`list_windows`** 를 `tmux … -t <window_id>` 직접 호출로 바꿨다. tmux 는 창 ID 로 활성 pane 을 자동 타게팅하므로 애초에 열거가 필요 없다
+  - 🚨 **초안은 `list_windows` 를 빼먹어 「전달 경로 해결」 주장이 성립하지 않았다**(리뷰가 Critical 로 잡음). `find_window_by_id` 가 `list_windows` 를 부르고, `session.py` 의 `send_to_window` 와 `bot.py` 십여 곳이 **실제 전송 전에** 그걸 먼저 부른다. 게다가 옛 `for window in session.windows:` 는 `try` **밖**이라 예외가 그대로 전파되고, `bot.py` 핸들러에는 감싸는 `try` 도 전역 `error_handler` 도 없다 — 즉 그 메시지는 조용히 유실된다. 「마지막 액션」만 고치고 「창 찾기」를 남겨두면 아무것도 해결되지 않았다
+  - 파싱은 **개행에 안전하게** 짰다(`parse_window_records`) — 모든 필드를 `\x1f` 로 종단하고 **구분자 개수로 재조립**한다. 값에 개행이 몇 개 있든 안전하고, 값이 구분자를 품으면 어긋난 결과 대신 실패로 처리한다(업스트림 #752 의 수정 방식과 같다)
+  - `_send_via_paste` 의 **버퍼 누출**도 막았다(리뷰 Critical) — 창 조회를 없애면서 `set-buffer` 가 먼저 실행되게 됐고, `paste-buffer` 가 실패하면 `-d` 가 발동하지 않아 **사용자 메시지 전문이 담긴 버퍼가 남는다.** 실패 시 `delete-buffer` 로 명시 정리한다
+  - `_tmux()` 실패 로그는 **WARNING** 이다 — 창을 찾은 뒤 명령을 보내는 사이 사용자가 창을 닫는 정상 레이스가 있고, 예전엔 그 경우 로그가 아예 없었다. ERROR 로 올리면 정상 상황이 소음이 된다(리뷰 지적)
+  - ⚠️ `send-keys -l` 과 `rename-window` 에 **`--` 를 붙였다.** 없으면 `-` 로 시작하는 문자열이 플래그로 파싱된다(실측: `-x` → `unknown flag -x`). libtmux 는 안 붙이므로 이 부분은 **원본보다 안전**하다
+
+### Changed
+
+- **`capture_pane` 이 3배 빨라졌다** (실측 **13.7ms → 5.5ms**/회). 캡처 한 번마다 42개 pane 을 126필드(2222자 포맷)로 열거하던 것을 없앴다. 상태 폴링이 1초 주기라 상시 부하였다
+- **회귀 테스트 7건 신설** (`tests/ccbot/test_tmux_window_parsing.py`) — 평문 / 개행 든 cwd / 첫·중간·마지막 필드 개행 / 오염 레코드가 정상 사이에 낀 경우 / 빈 값·빈 출력 / 위조된 구분자 탐지 / main 창 제외 유지. 이번 변경 전엔 `tmux_manager` 에 대응 테스트가 전혀 없었다(리뷰 지적)
+
+---
+
 ## [1.0.9] - 2026-09-04
 
 `scripts/restart.sh` 가 launchd 배포를 몰라 쓸 수 없던 것을 고친다.

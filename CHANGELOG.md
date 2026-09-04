@@ -14,6 +14,25 @@
 
 ---
 
+## [1.0.9] - 2026-09-04
+
+`scripts/restart.sh` 가 launchd 배포를 몰라 쓸 수 없던 것을 고친다.
+
+### Fixed
+
+- **`restart.sh` 가 launchd(KeepAlive) 배포에서 동작하지 않던 문제** (`scripts/restart.sh`)
+  - 이 스크립트는 upstream 의 「tmux `__main__` 창에서 `uv run ccbot`」을 전제한다. launchd 배포에는 둘 다 없다 — `__main__` 창이 없어 창 검사에서 `exit 1` 로 멈추고(지금은 이 덕에 사고가 안 났다), `pgrep` 패턴이 실제 프로세스(`~/.local/bin/ccbot start`)를 못 잡는다
+  - ⚠️ **창 이름만 맞으면 「안 돌고 있다」로 오판해 두 번째 인스턴스를 띄운다.** 같은 토큰으로 봇 둘이 폴링하면 Telegram `getUpdates` 가 충돌한다
+  - 수정 — launchd job 을 **자동 탐지**하고(`CCBOT_LAUNCHD_LABEL` 로 덮어쓰기 가능) 그쪽 규약으로 재시작한다. **자식 프로세스에만 SIGTERM** 을 보내고 KeepAlive 가 올리게 둔다. 감독 스크립트를 죽이지 않으므로 uptime 기반 실패 카운터 리셋이 정상 동작한다. **upstream 의 tmux 경로는 그대로 남겼다**
+  - `pgrep` 패턴에 `bin/ccbot start` 추가. 🚨 그리고 결과를 `kill` 하므로 **패턴을 인자로 가진 셸**(`bash -c '… bin/ccbot start …'`)을 걸러낸다 — `$$`/`$PPID` 만 빼는 것으로는 조부모 셸이 안 걸러진다(실측 확인)
+  - 성공 판정에 **생존 확인 8초** 추가. 「새 PID 존재」만 보면 크래시 루프를 성공으로 보고한다
+
+### Changed
+
+- **`set -euo pipefail` + `| head -1` 의 SIGPIPE 함정 제거** (`scripts/restart.sh`) — `head` 가 파이프를 먼저 닫아 앞 단계가 SIGPIPE 로 죽고 `pipefail` 이 그걸 스크립트 실패로 만든다. 실측으로 당했다: 재기동 대기 중 **아무 메시지 없이 `exit 1`** 이 났는데 정작 봇은 정상 기동해 있었다. `first_line()` 헬퍼로 교체했고, upstream 코드의 같은 자리(`UV_PID=$(pgrep … | head -1)`)도 함께 고쳤다
+
+---
+
 ## [1.0.8] - 2026-09-04
 
 v1.0.6·v1.0.7 이 증상을 막았다면, 이번엔 **근본 원인**을 없앤다.

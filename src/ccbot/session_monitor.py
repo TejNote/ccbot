@@ -45,6 +45,9 @@ CANDIDATE_ALIVE_WITHIN_SEC = 180.0
 # 같은 경고를 이 주기로만 반복한다. 폴링이 2초라 무제한이면 로그가 쌓이고,
 # 「한 번만」이면 반대로 오래 갇힌 상태가 사실상 안 보인다(둘 다 겪었다).
 REWARN_SEC = 600.0
+# cwd 로 계산한 폴더에 sid 의 jsonl 이 없을 때, projects/ 전체를 되짚는 주기.
+# 매 폴링(2초)마다 glob 하면 프로젝트 폴더 수만큼 stat 이 돈다.
+SID_RESCAN_SEC = 30.0
 
 
 @dataclass
@@ -136,6 +139,10 @@ class SessionMonitor:
         self._sid_first_seen: dict[tuple[str, str], float] = {}
         # 재채택을 처음 거부한 시각(창·후보 조합별). 자기 치유의 기준점이다.
         self._refused_since: dict[tuple[str, str], float] = {}
+        # sid → 실제 jsonl 경로. cwd 로 계산한 폴더에 없을 때 되짚은 결과를 캐시한다.
+        self._sid_jsonl_cache: dict[str, Path] = {}
+        # sid → 마지막으로 projects/ 전체를 훑은 시각(못 찾은 경우 포함).
+        self._sid_scan_at: dict[str, float] = {}
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -551,6 +558,41 @@ class SessionMonitor:
 
         return current_map
 
+    def _locate_session_jsonl(
+        self, project_dir: Path, sid: str, now: float
+    ) -> Path | None:
+        """추적 중인 세션의 jsonl 을 찾는다. cwd 로 계산한 폴더가 1순위다.
+
+        🚨 auto-detect 는 오래 「그 sid 의 jsonl 은 cwd 로 계산한 폴더에 있다」를
+           전제했다. 훅이 그 창의 cwd 를 **하위 폴더로** 갱신하면 전제가 깨진다 —
+           세션의 jsonl 은 시작 당시 cwd 로 만든 폴더에 그대로 있기 때문이다.
+           그러면 mtime 0 → 「낡았다」 → 엉뚱한 폴더의 최신 파일로 갈아탄다.
+
+           2026-09-03 17:10:59 @2 가 정확히 그랬다(로그 27644-27647) —
+           훅이 cwd 를 `Metlife/insudeal-x-backend` 로 바꾼 3ms 뒤 auto-detect 가
+           살아 있는 06b58ae5 를 버리고 그 폴더의 최신 파일(834296ff, **08-04**,
+           한 달 전 죽은 세션)로 갈아탔다. metlife 토픽이 17시간 출력 0 이었다.
+
+        그래서 못 찾으면 `projects/` 전체를 되짚는다. 매 폴링(2초)마다 훑으면
+        프로젝트 폴더 수만큼 stat 이 도므로 `SID_RESCAN_SEC` 주기로 제한한다.
+        """
+        direct = project_dir / f"{sid}.jsonl"
+        if direct.exists():
+            return direct
+
+        cached = self._sid_jsonl_cache.get(sid)
+        if cached is not None and cached.exists():
+            return cached
+
+        if now - self._sid_scan_at.get(sid, 0.0) < SID_RESCAN_SEC:
+            return None
+        self._sid_scan_at[sid] = now  # 못 찾아도 기록한다 — 그래야 주기가 걸린다
+        self._sid_jsonl_cache.pop(sid, None)
+        for cand in self.projects_path.glob(f"*/{sid}.jsonl"):
+            self._sid_jsonl_cache[sid] = cand
+            return cand
+        return None
+
     def _warn_periodically(
         self, wkey: tuple[str, str], now: float, msg: str, *args: object
     ) -> None:
@@ -653,19 +695,67 @@ class SessionMonitor:
             #    NFS 순단·권한 일시변경 같은 일시적 실패가 「낡았다」로 읽혀, 폴더의 더
             #    오래된 jsonl 조차 «더 최신» 으로 오판돼 **멀쩡한 세션이 교체된다.**
             #    그러면 정상 교체 INFO 만 남아 원인 흔적이 안 남는다(리뷰 지적).
-            current_jsonl = project_dir / f"{current_sid}.jsonl"
-            try:
-                current_mtime = (
-                    current_jsonl.stat().st_mtime if current_jsonl.exists() else 0.0
-                )
-            except OSError as e:
-                logger.debug(
-                    "stat 실패로 이번 폴링을 건너뛴다: %s (%s) — %s",
-                    current_jsonl,
-                    key,
-                    e,
-                )
-                continue
+            current_jsonl = self._locate_session_jsonl(project_dir, current_sid, now)
+            if current_jsonl is None:
+                current_mtime = 0.0
+            else:
+                try:
+                    current_mtime = current_jsonl.stat().st_mtime
+                except OSError as e:
+                    logger.debug(
+                        "stat 실패로 이번 폴링을 건너뛴다: %s (%s) — %s",
+                        current_jsonl,
+                        key,
+                        e,
+                    )
+                    continue
+
+                # jsonl 이 cwd 로 계산한 폴더 밖에 있다 = session_map 의 cwd 가 틀렸다.
+                #
+                # 🚨 여기서 `continue` 하면 안 된다. cwd 를 못 고치는 경우(jsonl 에 cwd
+                #    필드가 없어 빈 문자열이 오거나, 읽은 값이 저장된 값과 같은 경우)
+                #    매 폴링마다 같은 분기로 돌아와 **이 창의 auto-detect 가 통째로,
+                #    로그 한 줄 없이 영구 정지**한다. 초안이 그랬고 리뷰가 재현했다 —
+                #    이 패치가 막으려던 「증상은 같은데 원인 흔적이 없다」를 새 경로에서
+                #    그대로 되풀이하는 셈이었다.
+                #
+                # 그래서 둘을 분리한다 —
+                #   ① 스캔 기준(project_dir)은 **언제나** 실제 폴더로 옮긴다. 그래야
+                #      후보 스캔이 엉뚱한 곳을 뒤져 죽은 세션을 집지 않는다
+                #   ② session_map 의 cwd 교정은 «할 수 있으면» 한다(부가 효과)
+                # 어느 쪽이든 경고는 남긴다. 조용히 넘기면 훅이 왜 그랬는지 못 본다.
+                if current_jsonl.parent != project_dir:
+                    real_cwd = await asyncio.to_thread(
+                        read_cwd_from_jsonl, current_jsonl
+                    )
+                    wkey = (key, current_sid + "#cwd")
+                    if real_cwd and real_cwd != cwd:
+                        self._warn_periodically(
+                            wkey,
+                            now,
+                            "%s: session_map 의 cwd 가 %s 인데 %s 의 jsonl 은 %s 에 "
+                            "있다. cwd 를 실제 위치로 고치고 스캔 기준을 옮긴다.",
+                            key,
+                            cwd,
+                            current_sid,
+                            current_jsonl.parent,
+                        )
+                        info["cwd"] = real_cwd
+                        changed = True
+                    else:
+                        self._warn_periodically(
+                            wkey,
+                            now,
+                            "%s: session_map 의 cwd 가 %s 인데 %s 의 jsonl 은 %s 에 "
+                            "있다. jsonl 에서 실제 cwd 를 못 읽어 session_map 은 그대로 "
+                            "두고 스캔 기준만 옮긴다 — cwd 가 계속 어긋나 있다.",
+                            key,
+                            cwd,
+                            current_sid,
+                            current_jsonl.parent,
+                        )
+                    # ① 은 교정 성공 여부와 무관하게 이번 폴링부터 바로 적용한다
+                    project_dir = current_jsonl.parent
 
             # 🚨 훅·세션 피커가 방금 등록한 세션은 jsonl 이 아직 만들어지지 않았다(mtime 0).
             #    그걸 «낡았다» 로 보고 폴더 최신 파일로 갈아타면 **살아 있는 세션을 버린다.**
@@ -810,6 +900,20 @@ class SessionMonitor:
             self._refused_since = {
                 k: v for k, v in self._refused_since.items() if k[0] != key
             }
+
+        # sid 캐시는 창이 아니라 sid 로 키를 잡으므로, 지금 추적하지 않는 sid 는 버린다.
+        # 안 버리면 세션이 바뀔 때마다 한 칸씩 쌓인다.
+        live_sids = {
+            v.get("session_id", "")
+            for k, v in session_map.items()
+            if k.startswith(prefix)
+        }
+        self._sid_jsonl_cache = {
+            k: v for k, v in self._sid_jsonl_cache.items() if k in live_sids
+        }
+        self._sid_scan_at = {
+            k: v for k, v in self._sid_scan_at.items() if k in live_sids
+        }
 
         if changed:
             try:

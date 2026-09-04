@@ -559,8 +559,12 @@ class SessionMonitor:
         return current_map
 
     def _locate_session_jsonl(
-        self, project_dir: Path, sid: str, now: float
-    ) -> Path | None:
+        self,
+        project_dir: Path,
+        sid: str,
+        now: float,
+        transcript_path: str = "",
+    ) -> tuple[Path | None, str]:
         """추적 중인 세션의 jsonl 을 찾는다. cwd 로 계산한 폴더가 1순위다.
 
         🚨 auto-detect 는 오래 「그 sid 의 jsonl 은 cwd 로 계산한 폴더에 있다」를
@@ -573,25 +577,36 @@ class SessionMonitor:
            살아 있는 06b58ae5 를 버리고 그 폴더의 최신 파일(834296ff, **08-04**,
            한 달 전 죽은 세션)로 갈아탔다. metlife 토픽이 17시간 출력 0 이었다.
 
-        그래서 못 찾으면 `projects/` 전체를 되짚는다. 매 폴링(2초)마다 훑으면
-        프로젝트 폴더 수만큼 stat 이 도므로 `SID_RESCAN_SEC` 주기로 제한한다.
+        v1.0.8 부터는 훅이 `transcript_path` 를 같이 남기므로 **추측할 필요가 없다**
+        — 그게 0순위다. 되짚기는 그 필드가 없는 옛 항목용 폴백으로 남는다.
+        매 폴링(2초)마다 훑으면 프로젝트 폴더 수만큼 stat 이 도므로
+        `SID_RESCAN_SEC` 주기로 제한한다.
+
+        Returns:
+            (경로 또는 None, 찾은 방법) — 방법은 transcript / direct / scan.
         """
+        # 0순위 — 훅이 넘겨준 authoritative 경로. 추측이 아니다.
+        if transcript_path:
+            tp = Path(transcript_path)
+            if tp.stem == sid and tp.exists():
+                return tp, "transcript"
+
         direct = project_dir / f"{sid}.jsonl"
         if direct.exists():
-            return direct
+            return direct, "direct"
 
         cached = self._sid_jsonl_cache.get(sid)
         if cached is not None and cached.exists():
-            return cached
+            return cached, "scan"
 
         if now - self._sid_scan_at.get(sid, 0.0) < SID_RESCAN_SEC:
-            return None
+            return None, ""
         self._sid_scan_at[sid] = now  # 못 찾아도 기록한다 — 그래야 주기가 걸린다
         self._sid_jsonl_cache.pop(sid, None)
         for cand in self.projects_path.glob(f"*/{sid}.jsonl"):
             self._sid_jsonl_cache[sid] = cand
-            return cand
-        return None
+            return cand, "scan"
+        return None, ""
 
     def _warn_periodically(
         self, wkey: tuple[str, str], now: float, msg: str, *args: object
@@ -695,7 +710,9 @@ class SessionMonitor:
             #    NFS 순단·권한 일시변경 같은 일시적 실패가 「낡았다」로 읽혀, 폴더의 더
             #    오래된 jsonl 조차 «더 최신» 으로 오판돼 **멀쩡한 세션이 교체된다.**
             #    그러면 정상 교체 INFO 만 남아 원인 흔적이 안 남는다(리뷰 지적).
-            current_jsonl = self._locate_session_jsonl(project_dir, current_sid, now)
+            current_jsonl, located_by = self._locate_session_jsonl(
+                project_dir, current_sid, now, info.get("transcript_path", "")
+            )
             if current_jsonl is None:
                 current_mtime = 0.0
             else:
@@ -724,7 +741,19 @@ class SessionMonitor:
                 #      후보 스캔이 엉뚱한 곳을 뒤져 죽은 세션을 집지 않는다
                 #   ② session_map 의 cwd 교정은 «할 수 있으면» 한다(부가 효과)
                 # 어느 쪽이든 경고는 남긴다. 조용히 넘기면 훅이 왜 그랬는지 못 본다.
-                if current_jsonl.parent != project_dir:
+                if current_jsonl.parent != project_dir and located_by == "transcript":
+                    # 훅이 준 경로다. cwd 가 떠도는 건 **정상**이므로(공식 문서상
+                    # cwd 는 「훅이 불린 그 순간의 폴더」다) 경고하지 않고 cwd 도
+                    # 고치지 않는다 — 고쳐 봐야 다음 compact 에 다시 덮인다.
+                    # 스캔 기준만 실제 폴더로 옮긴다.
+                    logger.debug(
+                        "%s: cwd(%s)와 jsonl 위치(%s)가 다르다 — transcript_path 기준으로 본다",
+                        key,
+                        cwd,
+                        current_jsonl.parent,
+                    )
+                    project_dir = current_jsonl.parent
+                elif current_jsonl.parent != project_dir:
                     real_cwd = await asyncio.to_thread(
                         read_cwd_from_jsonl, current_jsonl
                     )

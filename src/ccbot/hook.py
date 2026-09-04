@@ -131,6 +131,37 @@ def _install_hook() -> int:
     return 0
 
 
+def _validate_transcript_path(transcript_path: str, session_id: str) -> str:
+    """훅 페이로드의 `transcript_path` 를 검증한다. 못 믿으면 빈 문자열.
+
+    🚨 왜 이 필드가 필요한가 — `cwd` 로는 그 세션의 jsonl 위치를 알 수 없다.
+       공식 문서상 `cwd` 는 "Current working directory when the hook is invoked" 다.
+       세션이 시작한 폴더가 아니라 **훅이 불린 그 순간의 폴더**이고, Bash 의 `cd` 가
+       유지되므로 긴 세션에서는 계속 떠돈다(실측: 한 세션에서 359회 전환, 폴더 6종).
+       그런데 jsonl 은 **시작 시점 cwd** 로 만든 폴더에 고정된다.
+
+       SessionStart 는 `compact` 에도 발화한다(= 세션 도중이다). 그래서 하위 폴더에서
+       자동 압축이 걸리면 둘이 어긋난다 — 2026-09-03 17:10:59 `@2` 가 그랬고
+       (jsonl 에 `subtype=compact_boundary` 기록) metlife 토픽이 17시간 죽었다.
+
+       `transcript_path` 는 페이로드가 주는 authoritative 경로다. 추측이 사라진다.
+    """
+    if not transcript_path:
+        return ""
+    if not os.path.isabs(transcript_path):
+        logger.warning("transcript_path is not absolute: %s", transcript_path)
+        return ""
+    if Path(transcript_path).stem != session_id:
+        # 이름이 session_id 와 다르면 우리가 아는 규칙 밖이다 — 믿지 않는다.
+        logger.warning(
+            "transcript_path stem != session_id (%s vs %s), ignoring",
+            Path(transcript_path).stem,
+            session_id,
+        )
+        return ""
+    return transcript_path
+
+
 def hook_main() -> None:
     """Process a Claude Code hook event from stdin, or install the hook."""
     # Configure logging for the hook subprocess (main.py logging doesn't apply here)
@@ -166,6 +197,7 @@ def hook_main() -> None:
 
     session_id = payload.get("session_id", "")
     cwd = payload.get("cwd", "")
+    transcript_path = payload.get("transcript_path", "")
     event = payload.get("hook_event_name", "")
 
     if not session_id or not event:
@@ -181,6 +213,8 @@ def hook_main() -> None:
     if cwd and not os.path.isabs(cwd):
         logger.warning("cwd is not absolute: %s", cwd)
         return
+
+    transcript_path = _validate_transcript_path(transcript_path, session_id)
 
     if event != "SessionStart":
         logger.debug("Ignoring non-SessionStart event: %s", event)
@@ -284,11 +318,15 @@ def hook_main() -> None:
                             "Failed to read existing session_map, starting fresh"
                         )
 
-                session_map[session_window_key] = {
+                entry = {
                     "session_id": session_id,
                     "cwd": cwd,
                     "window_name": window_name,
                 }
+                # 옛 항목과 섞이므로 «있을 때만» 넣는다. 읽는 쪽은 없으면 폴백한다.
+                if transcript_path:
+                    entry["transcript_path"] = transcript_path
+                session_map[session_window_key] = entry
 
                 # Clean up old-format key ("session:window_name") if it exists.
                 # Previous versions keyed by window_name instead of window_id.
@@ -301,10 +339,11 @@ def hook_main() -> None:
 
                 atomic_write_json(map_file, session_map)
                 logger.info(
-                    "Updated session_map: %s -> session_id=%s, cwd=%s",
+                    "Updated session_map: %s -> session_id=%s, cwd=%s, transcript=%s",
                     session_window_key,
                     session_id,
                     cwd,
+                    transcript_path or "(없음)",
                 )
             finally:
                 fcntl.flock(lock_f, fcntl.LOCK_UN)

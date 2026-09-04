@@ -1,6 +1,6 @@
 [project]
 name = "ccbot"
-version = "1.0.7"
+version = "1.0.8"
 description = "Telegram Bot for monitoring Claude Code sessions"
 readme = "README.md"
 requires-python = ">=3.12"

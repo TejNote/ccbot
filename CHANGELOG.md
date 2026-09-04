@@ -14,6 +14,23 @@
 
 ---
 
+## [1.0.8] - 2026-09-04
+
+v1.0.6·v1.0.7 이 증상을 막았다면, 이번엔 **근본 원인**을 없앤다.
+
+### Fixed
+
+- **훅이 `transcript_path` 를 남기지 않아 jsonl 위치를 cwd 로 추측하던 문제** (`hook.py` · `session_monitor.py`)
+  - 근본 원인 규명(공식 문서 `code.claude.com/docs/en/hooks`) — 훅 페이로드의 `cwd` 는 **"Current working directory when the hook is invoked"** 다. 세션이 **시작한** 폴더가 아니라 훅이 불린 **그 순간**의 폴더다. Bash 의 `cd` 가 유지되므로 긴 세션에서는 계속 떠돈다(실측: 한 세션에서 **cwd 전환 359회**, 폴더 6종). 그런데 jsonl 은 **시작 시점 cwd** 로 만든 폴더에 고정된다
+  - `SessionStart` 는 `compact` 에도 발화한다(= 세션 도중). 그래서 하위 폴더에서 자동 압축이 걸리면 둘이 어긋난다. 2026-09-03 17:10:59 `@2` 가 그랬고(jsonl 에 `subtype=compact_boundary` 기록, 초 단위 일치) **metlife 토픽이 17시간 죽었다**
+  - 같은 페이로드에 `transcript_path`("Path to conversation JSON")가 들어오는데 **레포 전체에서 한 번도 쓰지 않고 있었다**(`grep transcript_path` = 0건)
+  - 수정 — 훅이 `transcript_path` 를 검증해 `session_map` 에 함께 남기고(`_validate_transcript_path`: 절대경로 + stem 이 session_id 와 일치), 모니터가 **그걸 0순위**로 쓴다. 추측이 사라진다
+  - `transcript_path` 로 찾았을 때는 **cwd 를 고치지 않고 경고도 내지 않는다** — cwd 가 떠도는 건 정상이고, 고쳐 봐야 다음 compact 에 다시 덮인다. 스캔 기준만 실제 폴더로 옮긴다
+  - **호환** — 필드는 «있을 때만» 쓴다. 옛 항목은 v1.0.7 의 되짚기로 그대로 동작한다(추가 필드라 스키마 깨짐 없음). 각 창은 다음 SessionStart 때 필드를 얻는다
+  - 회귀 테스트 10건 — `test_session_monitor_transcript_path.py` 6건(사고 재현 / cwd 미변경 / 무경고 / 스캔 기준 이동 / 낡은 경로 무시 / 필드 없을 때 폴백) + `test_hook.py` 4건(검증 함수). **transcript 경로를 무력화하면 3건이 실패**함을 확인했다
+
+---
+
 ## [1.0.7] - 2026-09-04
 
 v1.0.6 이 못 막은 **같은 버그의 변종** — cwd 가 어긋나면 살아 있는 세션을 여전히 버렸다.

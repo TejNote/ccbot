@@ -32,7 +32,10 @@ class TestDetection:
     def test_trust_dialog_is_not_prompt_ready(self):
         assert not is_prompt_ready(load("trust_dialog.txt"))
 
-    @pytest.mark.parametrize("name", ["ready_bypass.txt", "ready_manual_mode.txt"])
+    @pytest.mark.parametrize(
+        "name",
+        ["ready_bypass.txt", "ready_manual_mode.txt", "ready_labelled_separator.txt"],
+    )
     def test_ready_prompt(self, name):
         pane = load(name)
         assert is_prompt_ready(pane)

@@ -243,8 +243,15 @@ def find_menu_option(pane_text: str, needle: str) -> tuple[int, int] | None:
 
 
 def _is_separator(line: str) -> bool:
+    """A chrome border line.
+
+    Named sessions (--resume <name>, --name, /rename) put the name in the
+    input box's top border: "──────── my-session ─" (one trailing dash).
+    """
     stripped = line.strip()
-    return len(stripped) >= 20 and all(c == "─" for c in stripped)
+    if len(stripped) < 20 or not stripped.startswith("────"):
+        return False
+    return stripped.endswith("─") and stripped.count("─") / len(stripped) >= 0.6
 
 
 def is_prompt_ready(pane_text: str) -> bool:

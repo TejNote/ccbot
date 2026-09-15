@@ -29,6 +29,8 @@ from telegram.error import BadRequest
 from ..config import config
 from ..session import session_manager
 from ..terminal_parser import (
+    AUTO_ANSWER_DIALOGS,
+    extract_interactive_content,
     is_interactive_ui,
     parse_codex_status_line,
     parse_status_line,
@@ -182,6 +184,14 @@ async def update_status_message(
         # User is in interactive mode for a DIFFERENT window (window switched)
         # Clear stale interactive mode
         await clear_interactive_msg(user_id, bot, thread_id)
+
+    # Startup dialogs (workspace trust) are answered by the bot itself
+    # rather than rendered as a keyboard.
+    if should_check_new_ui:
+        ui = extract_interactive_content(pane_text)
+        if ui is not None and ui.name in AUTO_ANSWER_DIALOGS:
+            await tmux_manager.auto_answer_dialog(window_id, pane_text)
+            return
 
     # Check for permission prompt (interactive UI not triggered via JSONL)
     # ALWAYS check UI, regardless of skip_status

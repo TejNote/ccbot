@@ -12,7 +12,7 @@ Provides background polling of terminal status lines for all active users:
 
 Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (1 second)
-  - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
+  - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (5 seconds)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
   - _should_send_status: Adaptive throttle for timer status updates
@@ -50,7 +50,15 @@ logger = logging.getLogger(__name__)
 # Timer-based status updates are throttled adaptively by _should_send_status().
 STATUS_POLL_INTERVAL = 1.0  # seconds
 
-# Topic existence probe interval
+# Topic existence probe interval.
+# ⚠️ upstream #81 이 60초 → 5초로 낮췄다. 목적은 DM 모드에서 삭제된 토픽을 빨리 잡는
+#    것인데(private chat 은 unpinAllForumTopicMessages 가 아무 thread_id 에나 ok=true 를
+#    준다), 바인딩 1개당 API 호출이 **12배**가 된다 — 토픽 6개면 분당 72회다.
+#    같은 브랜치의 #52 가 "레이트 리밋 때문에 봇이 장시간 침묵한다" 며 상태 업데이트를
+#    스로틀하는 것과 방향이 반대라 서로 상쇄될 수 있다.
+#    지금은 upstream 값을 그대로 둔다 — **레이트 리밋을 실제로 맞은 관측이 없다.**
+#    맞으면 여기를 15~20초로 올린다(죽은 토픽은 전송 실패 경로의
+#    _maybe_cleanup_dead_topic 이 이미 즉시 잡으므로 이 프로브는 백스톱이다).
 TOPIC_CHECK_INTERVAL = 5.0  # seconds
 
 # Substrings in BadRequest messages that indicate the topic is gone
@@ -175,6 +183,11 @@ async def update_status_message(
         # User is in interactive mode for THIS window
         if is_interactive_ui(pane_text):
             # Interactive UI still showing — skip status update (user is interacting)
+            # 🚨 타이핑은 반드시 끈다. 여기서 빠져나가면 아래 set_typing 에 닿지 못해,
+            #    직전 폴링에서 켜진 표시가 4초마다 계속 나간다. 퍼미션 프롬프트는
+            #    사람이 답할 때까지 몇 시간도 떠 있고, 그 내내 "작업 중" 으로 보인다.
+            #    실제로는 봇이 **사용자를 기다리는 중**이다.
+            set_typing(bot, user_id, thread_id, False)
             return
         # Interactive UI gone — clear interactive mode, fall through to status check.
         # Don't re-check for new UI this cycle (the old one just disappeared).
@@ -191,6 +204,7 @@ async def update_status_message(
         ui = extract_interactive_content(pane_text)
         if ui is not None and ui.name in AUTO_ANSWER_DIALOGS:
             await tmux_manager.auto_answer_dialog(window_id, pane_text)
+            set_typing(bot, user_id, thread_id, False)   # 위와 같은 이유
             return
 
     # Check for permission prompt (interactive UI not triggered via JSONL)
@@ -203,9 +217,12 @@ async def update_status_message(
             thread_id,
         )
         await handle_interactive_ui(bot, user_id, window_id, thread_id)
+        set_typing(bot, user_id, thread_id, False)   # 위와 같은 이유
         return
 
     # Normal status line check — skip if queue is non-empty
+    # 🔎 여기는 타이핑을 끄지 않는다 — 큐가 찬 일시적 상태이고, 에이전트는 실제로
+    #    작업 중이다. 껐다 켜면 표시가 깜빡인다.
     if skip_status:
         return
 

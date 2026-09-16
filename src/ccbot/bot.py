@@ -1299,6 +1299,15 @@ async def _create_and_bind_window(
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
+    # 🚨 콜백 응답을 **먼저** 보낸다. 텔레그램은 answerCallbackQuery 를 약 15초 안에
+    #    받아야 하고, 넘기면 "query is too old and response timeout expired" 를 낸다.
+    #    아래 경로는 wait_for_claude_ready(최대 30초) + wait_for_session_map_entry
+    #    (5~15초) 를 거치므로 최악 45초다 — 예전엔 그 뒤에 응답해서, 창 하나가 느리면
+    #    예외가 나고 그동안 사용자 버튼은 계속 로딩 상태였다.
+    #    결과(✅/❌)는 아래 safe_edit 가 메시지 본문으로 보여주므로 잃는 정보가 없다.
+    #    answerCallbackQuery 는 쿼리당 1회라 함수 끝의 두 번째 호출은 없앴다.
+    await query.answer("Creating…")
+
     if config.auto_trust_dirs:
         await asyncio.to_thread(ensure_trusted_directory, selected_path)
 
@@ -1418,7 +1427,6 @@ async def _create_and_bind_window(
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
-    await query.answer("Created" if success else "Failed")
 
 
 # --- Callback query handler ---

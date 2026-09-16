@@ -349,9 +349,11 @@ def parse_status_line(pane_text: str) -> str | None:
     separator (a full line of ``─`` characters).  We locate the separator
     first, then scan upward.  The line *directly* above it counts as a status
     line on the spinner alone; further up, Claude Code may have rendered a tip
-    block in between, so a spinner line only counts when it also carries the
-    ``…`` of a live status — that keeps ``·`` bullets in regular output and the
-    finished marker (``✻ Sautéed for 7s``) from being mistaken for status.
+    block in between, so a spinner line only counts when it carries the ``…``
+    of a live status **and** is not a plain ``·`` bullet.  That pair of
+    conditions applies to non-adjacent lines only — directly above the
+    separator, ``✻ Sautéed for 7s`` is still returned as status (unchanged
+    behaviour).
 
     Returns the text after the spinner, or None if no status line found.
 
@@ -380,16 +382,27 @@ def parse_status_line(pane_text: str) -> str | None:
 
     # Scan upward for the spinner line. Claude Code can render a tip block
     # between the status line and the chrome, so keep looking past non-spinner
-    # lines — but once we're past the line directly above the separator, only a
-    # live status line counts. The ellipsis is what marks one, and it keeps
-    # prose bullets and the finished marker ("✻ Sautéed for 7s") out.
-    # (upstream six-ddc/ccbot#97)
+    # lines (upstream six-ddc/ccbot#97).
+    #
+    # 🚨 Past the line directly above the separator the bar is higher, because
+    #    prose lives up there. Two conditions, and both are needed:
+    #      - "…" — the finished marker ("✻ Sautéed for 7s") has no ellipsis
+    #      - not "·" — this is the one spinner glyph that is also an ordinary
+    #        bullet. Claude's own answers are full of "· item one…" lines, and
+    #        upstream's ellipsis-only rule let them through: a bullet three
+    #        lines above the separator became the status text. That misfire is
+    #        not cosmetic — status_polling lights the typing keepalive off this
+    #        return value, so a stray bullet in an idle pane leaves a ghost
+    #        status message and a typing indicator that never turns off.
+    #        tests/ccbot/test_terminal_parser.py has guarded this since before
+    #        the merge ("· in regular output must NOT be detected as status").
     adjacent = True
     for i in range(chrome_idx - 1, max(chrome_idx - 9, -1), -1):
         line = lines[i].strip()
         if not line:
             continue
-        if line[0] in STATUS_SPINNERS and (adjacent or "…" in line):
+        live = "…" in line and line[0] != "·"
+        if line[0] in STATUS_SPINNERS and (adjacent or live):
             rest = line[1:].strip()
             if (
                 _BACKGROUND_SHELL_RE.search(rest)

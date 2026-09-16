@@ -73,8 +73,17 @@ async def _maybe_cleanup_dead_topic(
     if thread_id is None:
         return
     from ..session import session_manager  # lazy: avoid circular import
+    from .cleanup import clear_topic_state  # lazy: avoid circular import
 
-    await session_manager.cleanup_dead_topic(int(chat_id), int(thread_id))
+    # 🚨 세션 상태만 푸는 것으로 끝나지 않는다. 핸들러 쪽 토픽별 추적(상태 메시지 ·
+    #    tool id · secondary id · **타이핑 keepalive 태스크**)은 여기서 안 지우면 그대로
+    #    남고, _typing_keepalive 는 while True 라 취소 전엔 죽지 않는다 — 텔레그램이
+    #    "그 토픽 없다" 고 답한 thread 로 4초마다 send_chat_action 을 영원히 던지게 된다.
+    #    다른 세 해제 경로(status_polling 2곳 · /kill · topic_closed)는 전부 부른다.
+    for user_id, t_id in await session_manager.cleanup_dead_topic(
+        int(chat_id), int(thread_id)
+    ):
+        await clear_topic_state(user_id, t_id)
 
 
 async def send_with_fallback(
@@ -128,10 +137,15 @@ async def send_photo(
     chat_id: int,
     image_data: list[tuple[str, bytes]],
     **kwargs: Any,
-) -> None:
+) -> list[int]:
     """Send photo(s) to chat. Sends as media group if multiple images.
 
     Rate limiting is handled globally by AIORateLimiter on the Application.
+
+    Returns the message ids actually sent (empty on failure) so callers can
+    track them — a tool_result's screenshot belongs to the same "secondary"
+    message group as its text, and an untracked photo outlives the text that
+    explained it.
 
     Args:
         bot: Telegram Bot instance
@@ -140,29 +154,31 @@ async def send_photo(
         **kwargs: Extra kwargs passed to send_photo/send_media_group
     """
     if not image_data:
-        return
+        return []
     try:
         if len(image_data) == 1:
             _media_type, raw_bytes = image_data[0]
-            await bot.send_photo(
+            sent = await bot.send_photo(
                 chat_id=chat_id,
                 photo=io.BytesIO(raw_bytes),
                 **kwargs,
             )
-        else:
-            media = [
-                InputMediaPhoto(media=io.BytesIO(raw_bytes))
-                for _media_type, raw_bytes in image_data
-            ]
-            await bot.send_media_group(
-                chat_id=chat_id,
-                media=media,
-                **kwargs,
-            )
+            return [sent.message_id]
+        media = [
+            InputMediaPhoto(media=io.BytesIO(raw_bytes))
+            for _media_type, raw_bytes in image_data
+        ]
+        msgs = await bot.send_media_group(
+            chat_id=chat_id,
+            media=media,
+            **kwargs,
+        )
+        return [m.message_id for m in msgs]
     except RetryAfter:
         raise
     except Exception as e:
         logger.error("Failed to send photo to %d: %s", chat_id, e)
+        return []
 
 
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:

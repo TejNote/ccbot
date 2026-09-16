@@ -377,16 +377,16 @@ def _send_kwargs(thread_id: int | None) -> dict[str, Any]:
     return {}
 
 
-async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
-    """Send images attached to a task, if any."""
+async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> list[int]:
+    """Send images attached to a task, if any. Returns their message ids."""
     if not task.image_data:
-        return
+        return []
     logger.info(
         "Sending %d image(s) in thread %s",
         len(task.image_data),
         task.thread_id,
     )
-    await send_photo(
+    return await send_photo(
         bot,
         chat_id,
         task.image_data,
@@ -544,11 +544,15 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     #    task (several secondary entries queued together, folded into one
     #    MessageTask by _merge_content_tasks) or a paginated local_command
     #    can produce more than one Telegram message here.
+    # 6. Send images if present (from tool_result with base64 image blocks)
+    #    🚨 이미지를 **먼저 보내고** 그 id 까지 함께 추적한다. 예전 순서(추적 → 전송)에서는
+    #       사진 id 가 목록에 안 들어가, 다음 메시지가 오면 **설명 텍스트만 지워지고
+    #       스크린샷이 맥락 없이 남았다.** tool_result 는 항상 is_secondary=True 라
+    #       스크린샷을 찍는 세션에서 매번 재현된다.
+    sent_msg_ids.extend(await _send_task_images(bot, chat_id, task))
+
     if sent_msg_ids and task.is_secondary:
         _secondary_msg_info[skey] = (sent_msg_ids, wid)
-
-    # 6. Send images if present (from tool_result with base64 image blocks)
-    await _send_task_images(bot, chat_id, task)
 
     # Status display is delegated to status_polling (1s interval) so the answer
     # always remains the last visible message until polling detects working state.

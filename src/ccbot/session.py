@@ -977,16 +977,27 @@ class SessionManager:
             self._save_state()
             logger.info("Purged window state for %s", window_id)
 
-    async def cleanup_dead_topic(self, chat_id: int, thread_id: int) -> bool:
+    async def cleanup_dead_topic(
+        self, chat_id: int, thread_id: int
+    ) -> list[tuple[int, int]]:
         """Tear down any binding whose chat_id+thread_id matches a dead topic.
 
         Called from send-failure paths when Telegram returns "Message thread not
-        found" / "Topic_id_invalid". The 60s topic-existence probe can miss this
-        in private chats (Telegram returns ok=true for unpinAllForumTopicMessages
-        on private chats with arbitrary thread_ids). Returns True if any binding
-        was cleaned up.
+        found" / "Topic_id_invalid". The topic-existence probe can miss this in
+        private chats (Telegram returns ok=true for unpinAllForumTopicMessages
+        on private chats with arbitrary thread_ids).
+
+        🚨 Returns the (user_id, thread_id) pairs it cleaned so the caller can
+        run clear_topic_state() on each. This method only unwinds *session*
+        state; the per-topic in-memory trackers in handlers/ (status message,
+        tool ids, secondary message ids, and the typing keepalive task) live
+        elsewhere and would otherwise survive. A surviving typing task is not a
+        harmless leak: _typing_keepalive loops forever, so the bot would keep
+        firing send_chat_action every 4s at a thread Telegram already told us is
+        gone. Upstream (#81) returned a bare bool and left that behind; the
+        other three unbind paths all call clear_topic_state.
         """
-        cleaned = False
+        cleaned: list[tuple[int, int]] = []
         for user_id, t_id, wid in list(self.iter_thread_bindings()):
             if t_id != thread_id:
                 continue
@@ -995,7 +1006,7 @@ class SessionManager:
             self.unbind_thread(user_id, t_id)
             self.purge_window(wid)
             await self.remove_session_map_entry(wid)
-            cleaned = True
+            cleaned.append((user_id, t_id))
             logger.info(
                 "Auto-cleaned dead topic via send error: "
                 "user=%d thread=%d window_id=%s",

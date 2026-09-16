@@ -41,6 +41,9 @@ from pathlib import Path
 from telegram import (
     Bot,
     BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -57,6 +60,7 @@ from telegram.ext import (
     filters,
 )
 
+from .claude_config import ensure_trusted_directory
 from .config import config
 from .skill_registry import SkillRegistry
 from .handlers.callback_data import (
@@ -155,12 +159,17 @@ _status_poll_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
+    "agents": "↗ 서브에이전트 관리",
     "clear": "↗ 대화 기록 초기화",
     "compact": "↗ 컨텍스트 압축",
+    "context": "↗ 컨텍스트 사용량 확인",
     "cost": "↗ 토큰/비용 확인",
     "help": "↗ Claude Code 도움말",
     "memory": "↗ CLAUDE.md 편집",
     "model": "↗ AI 모델 전환",
+    "recap": "↗ 이 세션 요약",
+    "status": "↗ 세션 상태 확인",
+    "tasks": "↗ 백그라운드 작업·서브에이전트 목록",
 }
 
 _skill_registry: SkillRegistry | None = None
@@ -225,6 +234,36 @@ _SKILL_DESC_KO: dict[str, str] = {
     # pr-review-toolkit
     "pr_review_toolkit_staged_review": "단계별 코드 리뷰",
 }
+
+
+# 클라이언트는 **그 채팅에 맞는 스코프**를 읽는다. 좁은 스코프가 기본 스코프를 이기므로,
+# 옛 설정(BotFather·구버전)이 남긴 all_private_chats 목록 하나가 진짜 메뉴를 가린다.
+# 그래서 지울 때는 관리자 스코프까지 넓게 지우고, 쓸 때는 실제로 쓰는 스코프에 다 쓴다.
+# (upstream six-ddc/ccbot#99 — 포럼 토픽에서 "/" 버튼이 비어 보이던 문제)
+_COMMAND_WRITE_SCOPES = (
+    None,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+)
+_COMMAND_CLEAR_SCOPES = _COMMAND_WRITE_SCOPES + (BotCommandScopeAllChatAdministrators,)
+
+
+async def _clear_bot_commands(bot: Bot) -> None:
+    """Drop the command menu from every scope we might have written before."""
+    for scope in _COMMAND_CLEAR_SCOPES:
+        try:
+            await bot.delete_my_commands(scope=scope() if scope else None)
+        except Exception as e:
+            logger.warning("delete_my_commands(%s) failed: %s", scope, e)
+
+
+async def _publish_bot_commands(bot: Bot, commands: list[BotCommand]) -> None:
+    """Register the command menu on every scope the bot is used from."""
+    for scope in _COMMAND_WRITE_SCOPES:
+        try:
+            await bot.set_my_commands(commands, scope=scope() if scope else None)
+        except Exception as e:
+            logger.warning("set_my_commands(%s) failed: %s", scope, e)
 
 
 def _build_bot_commands() -> list[BotCommand]:
@@ -376,6 +415,53 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "The Claude session is still running in tmux.\n"
         "Send a message to bind to a new session.",
     )
+
+
+async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kill the tmux window for this topic and delete the topic itself."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if wid:
+        display = session_manager.get_display_name(wid)
+        w = await tmux_manager.find_window_by_id(wid)
+        if w:
+            await tmux_manager.kill_window(w.window_id)
+            logger.info(
+                "/kill: killed window %s (user=%d, thread=%d)",
+                display,
+                user.id,
+                thread_id,
+            )
+        session_manager.unbind_thread(user.id, thread_id)
+        session_manager.purge_window(wid)
+        await session_manager.remove_session_map_entry(wid)
+        await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
+
+    chat = update.effective_chat
+    if chat is None:
+        await safe_reply(update.message, "✅ Session killed.")
+        return
+
+    try:
+        await context.bot.delete_forum_topic(
+            chat_id=chat.id, message_thread_id=thread_id
+        )
+    except Exception as e:
+        logger.warning("delete_forum_topic failed: %s", e)
+        await safe_reply(
+            update.message,
+            "✅ Session killed. Couldn't delete topic — close or delete it manually.",
+        )
 
 
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -578,6 +664,8 @@ async def topic_closed_handler(
                 thread_id,
             )
         session_manager.unbind_thread(user.id, thread_id)
+        session_manager.purge_window(wid)
+        await session_manager.remove_session_map_entry(wid)
         # Clean up all memory state for this topic
         await clear_topic_state(user.id, thread_id, context.bot, context.user_data)
     else:
@@ -1211,6 +1299,18 @@ async def _create_and_bind_window(
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
+    # 🚨 콜백 응답을 **먼저** 보낸다. 텔레그램은 answerCallbackQuery 를 약 15초 안에
+    #    받아야 하고, 넘기면 "query is too old and response timeout expired" 를 낸다.
+    #    아래 경로는 wait_for_claude_ready(최대 30초) + wait_for_session_map_entry
+    #    (5~15초) 를 거치므로 최악 45초다 — 예전엔 그 뒤에 응답해서, 창 하나가 느리면
+    #    예외가 나고 그동안 사용자 버튼은 계속 로딩 상태였다.
+    #    결과(✅/❌)는 아래 safe_edit 가 메시지 본문으로 보여주므로 잃는 정보가 없다.
+    #    answerCallbackQuery 는 쿼리당 1회라 함수 끝의 두 번째 호출은 없앴다.
+    await query.answer("Creating…")
+
+    if config.auto_trust_dirs:
+        await asyncio.to_thread(ensure_trusted_directory, selected_path)
+
     success, message, created_wname, created_wid = await tmux_manager.create_window(
         selected_path, resume_session_id=resume_session_id
     )
@@ -1224,6 +1324,12 @@ async def _create_and_bind_window(
             pending_thread_id,
             resume_session_id,
         )
+        # Wait for Claude Code's input box first. This answers the workspace
+        # trust dialog if it still appears; the SessionStart hook only fires
+        # once Claude is past it, and a pending message must not be typed
+        # into the dialog (Enter on the default option exits Claude).
+        await tmux_manager.wait_for_claude_ready(created_wid, timeout=30.0)
+
         # Wait for Claude Code's SessionStart hook to register in session_map.
         # Resume sessions take longer to start (loading session state), so use
         # a longer timeout to avoid silently dropping messages.
@@ -1321,7 +1427,6 @@ async def _create_and_bind_window(
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
-    await query.answer("Created" if success else "Failed")
 
 
 # --- Callback query handler ---
@@ -1770,7 +1875,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             # Re-register commands with new order
             new_commands = _build_bot_commands()
-            await context.bot.set_my_commands(new_commands)
+            await _publish_bot_commands(context.bot, new_commands)
         else:
             await query.answer("Unknown skill")
 
@@ -2013,6 +2118,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             # Enqueue content message task
             # Note: tool_result editing is handled inside _process_content_task
             # to ensure sequential processing with tool_use message sending
+            #
+            # Everything except the final assistant text answer (thinking,
+            # tool_use, tool_result, local_command, user-message echo) is
+            # "secondary" — it gets deleted once the next message for this
+            # topic arrives, so only the actual answer is left behind.
+            is_secondary = not (msg.role == "assistant" and msg.content_type == "text")
             await enqueue_content_message(
                 bot=bot,
                 user_id=user_id,
@@ -2023,6 +2134,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 text=msg.text,
                 thread_id=thread_id,
                 image_data=msg.image_data,
+                is_secondary=is_secondary,
             )
 
             # Update user's read offset to current file position
@@ -2042,7 +2154,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task, _skill_registry
 
-    await application.bot.delete_my_commands()
+    await _clear_bot_commands(application.bot)
 
     # Initialize skill registry and scan plugins
     _skill_registry = SkillRegistry(
@@ -2052,7 +2164,7 @@ async def post_init(application: Application) -> None:
     _skill_registry.scan()
 
     bot_commands = _build_bot_commands()
-    await application.bot.set_my_commands(bot_commands)
+    await _publish_bot_commands(application.bot, bot_commands)
 
     # Delete status messages left over from the previous run (orphaned on restart)
     orphaned = session_manager.pop_all_status_msg_ids()
@@ -2134,6 +2246,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("favorite", favorite_command))

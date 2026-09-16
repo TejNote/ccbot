@@ -84,6 +84,26 @@ class Config:
 
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 
+        # Adaptive throttle for timer-based status lines.
+        # Three comma-separated intervals (seconds) for elapsed-time tiers:
+        #   tier 1 (0–10 s), tier 2 (10–60 s), tier 3 (60 s+)
+        # Default "1,5,30" means: real-time for first 10 s, then every 5 s,
+        # then every 30 s.  Set to "1,1,1" to disable throttling.
+        self.status_throttle_intervals: tuple[float, float, float] = (1.0, 5.0, 30.0)
+        raw = os.getenv("STATUS_THROTTLE_INTERVALS", "")
+        if raw:
+            try:
+                parts = [float(x.strip()) for x in raw.split(",")]
+                if len(parts) != 3 or any(p < 0 for p in parts):
+                    raise ValueError("need exactly 3 non-negative numbers")
+                self.status_throttle_intervals = (parts[0], parts[1], parts[2])
+            except ValueError as e:
+                logger.warning(
+                    "Invalid STATUS_THROTTLE_INTERVALS=%r (%s), using defaults",
+                    raw,
+                    e,
+                )
+
         # Display user messages in history and real-time notifications
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = (
@@ -100,6 +120,12 @@ class Config:
         # Set to 0.0 to disable batching (sends each message individually)
         self.batch_window = float(os.getenv("CCBOT_BATCH_WINDOW", "0.0"))
 
+        # Pre-trust directories in ~/.claude.json before launching claude,
+        # so Claude Code's workspace trust dialog doesn't block new sessions
+        self.auto_trust_dirs = (
+            os.getenv("CCBOT_AUTO_TRUST_DIRS", "true").lower() != "false"
+        )
+
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
@@ -109,6 +135,12 @@ class Config:
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(
             "OPENAI_BASE_URL", "https://api.openai.com/v1"
+        )
+        # Transcription model — override when pointing OPENAI_BASE_URL at an
+        # OpenAI-compatible backend that serves different model names (e.g. a
+        # local Whisper server such as Speaches). Default: OpenAI's hosted model.
+        self.transcribe_model: str = os.getenv(
+            "CCBOT_TRANSCRIBE_MODEL", "gpt-4o-transcribe"
         )
 
         # Scrub sensitive vars from os.environ so child processes never inherit them.

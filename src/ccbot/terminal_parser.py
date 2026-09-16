@@ -48,6 +48,17 @@ class UIPattern:
 
 UI_PATTERNS: list[UIPattern] = [
     UIPattern(
+        # Workspace trust dialog shown on first launch in a directory.
+        # Since ~2.1.260 the options are unnumbered and "No, exit" is the
+        # default, so an unanswered or blindly-confirmed dialog ends the session.
+        name="TrustDialog",
+        top=(
+            re.compile(r"^\s*Quick safety check"),
+            re.compile(r"^\s*Do you trust the files in this folder"),
+        ),
+        bottom=(re.compile(r"Enter to confirm"),),
+    ),
+    UIPattern(
         name="ExitPlanMode",
         top=(
             re.compile(r"^\s*Would you like to proceed\?"),
@@ -120,6 +131,14 @@ UI_PATTERNS: list[UIPattern] = [
         ),
     ),
 ]
+
+
+# Dialogs the bot answers itself: name -> text of the option to select.
+AUTO_ANSWER_DIALOGS: dict[str, str] = {
+    "TrustDialog": "Yes, I trust",
+}
+
+_RE_MENU_CURSOR = re.compile(r"^\s*❯\s*\S")
 
 
 # ── Post-processing ──────────────────────────────────────────────────────
@@ -197,6 +216,65 @@ def is_interactive_ui(pane_text: str) -> bool:
     return extract_interactive_content(pane_text) is not None
 
 
+def find_menu_option(pane_text: str, needle: str) -> tuple[int, int] | None:
+    """Locate the highlighted (``❯``) line and the option containing ``needle``.
+
+    Returns ``(cursor_idx, option_idx)`` line indices; pressing Down
+    ``option_idx - cursor_idx`` times moves the cursor onto the option.
+    The option is searched from the bottom (dialogs render at the end of the
+    pane) and the cursor is the ``❯`` nearest to it, so an earlier shell
+    prompt such as ``❯ claude`` is never mistaken for the menu cursor.
+    """
+    lines = pane_text.split("\n")
+    option_idx = next(
+        (i for i in range(len(lines) - 1, -1, -1) if needle in lines[i]), None
+    )
+    if option_idx is None:
+        return None
+    lo, hi = max(0, option_idx - 10), min(len(lines), option_idx + 11)
+    cursor_idx = min(
+        (i for i in range(lo, hi) if _RE_MENU_CURSOR.match(lines[i])),
+        key=lambda i: abs(i - option_idx),
+        default=None,
+    )
+    if cursor_idx is None:
+        return None
+    return cursor_idx, option_idx
+
+
+def _is_separator(line: str) -> bool:
+    """A chrome border line.
+
+    Named sessions (--resume <name>, --name, /rename) put the name in the
+    input box's top border: "──────── my-session ─" (one trailing dash).
+    """
+    stripped = line.strip()
+    if len(stripped) < 20 or not stripped.startswith("────"):
+        return False
+    return stripped.endswith("─") and stripped.count("─") / len(stripped) >= 0.6
+
+
+def is_prompt_ready(pane_text: str) -> bool:
+    """True when Claude Code shows its idle input box.
+
+    Layout at the bottom of the pane::
+
+        ────────────────  (separator)
+        ❯ …               (input line)
+        ────────────────  (separator)
+          ⏵⏵ … (footer)
+    """
+    if not pane_text:
+        return False
+    tail = pane_text.rstrip().split("\n")[-8:]
+    for i in range(len(tail) - 2):
+        if not _is_separator(tail[i]) or not tail[i + 1].lstrip().startswith("❯"):
+            continue
+        if any(_is_separator(tail[j]) for j in range(i + 2, min(i + 5, len(tail)))):
+            return True
+    return False
+
+
 # ── Status line parsing ─────────────────────────────────────────────────
 
 # Spinner characters Claude Code uses in its status line
@@ -267,10 +345,15 @@ _BACKGROUND_SHELL_RE = re.compile(r"\b\d+\s+shells?\s+still\s+running\b")
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
-    The status line (spinner + working text) appears immediately above
-    the chrome separator (a full line of ``─`` characters).  We locate
-    the separator first, then check the line just above it — this avoids
-    false positives from ``·`` bullets in Claude's regular output.
+    The status line (spinner + working text) appears above the chrome
+    separator (a full line of ``─`` characters).  We locate the separator
+    first, then scan upward.  The line *directly* above it counts as a status
+    line on the spinner alone; further up, Claude Code may have rendered a tip
+    block in between, so a spinner line only counts when it carries the ``…``
+    of a live status **and** is not a plain ``·`` bullet.  That pair of
+    conditions applies to non-adjacent lines only — directly above the
+    separator, ``✻ Sautéed for 7s`` is still returned as status (unchanged
+    behaviour).
 
     Returns the text after the spinner, or None if no status line found.
 
@@ -297,12 +380,29 @@ def parse_status_line(pane_text: str) -> str | None:
     if chrome_idx is None:
         return None  # No chrome visible — can't determine status
 
-    # Check lines just above the separator (skip blanks, up to 4 lines)
-    for i in range(chrome_idx - 1, max(chrome_idx - 5, -1), -1):
+    # Scan upward for the spinner line. Claude Code can render a tip block
+    # between the status line and the chrome, so keep looking past non-spinner
+    # lines (upstream six-ddc/ccbot#97).
+    #
+    # 🚨 Past the line directly above the separator the bar is higher, because
+    #    prose lives up there. Two conditions, and both are needed:
+    #      - "…" — the finished marker ("✻ Sautéed for 7s") has no ellipsis
+    #      - not "·" — this is the one spinner glyph that is also an ordinary
+    #        bullet. Claude's own answers are full of "· item one…" lines, and
+    #        upstream's ellipsis-only rule let them through: a bullet three
+    #        lines above the separator became the status text. That misfire is
+    #        not cosmetic — status_polling lights the typing keepalive off this
+    #        return value, so a stray bullet in an idle pane leaves a ghost
+    #        status message and a typing indicator that never turns off.
+    #        tests/ccbot/test_terminal_parser.py has guarded this since before
+    #        the merge ("· in regular output must NOT be detected as status").
+    adjacent = True
+    for i in range(chrome_idx - 1, max(chrome_idx - 9, -1), -1):
         line = lines[i].strip()
         if not line:
             continue
-        if line[0] in STATUS_SPINNERS:
+        live = "…" in line and line[0] != "·"
+        if line[0] in STATUS_SPINNERS and (adjacent or live):
             rest = line[1:].strip()
             if (
                 _BACKGROUND_SHELL_RE.search(rest)
@@ -310,8 +410,7 @@ def parse_status_line(pane_text: str) -> str | None:
             ):
                 return None
             return rest
-        # First non-empty line above separator isn't a spinner → no status
-        return None
+        adjacent = False
     return None
 
 

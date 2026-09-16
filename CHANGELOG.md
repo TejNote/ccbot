@@ -14,6 +14,115 @@
 
 ---
 
+## [1.1.0] - 2026-09-16
+
+upstream 커뮤니티 PR 9건을 선별 머지한다. **upstream `main` 은 2026-07-08 이후 멈춰 있고
+이 fork 는 이미 완전 동기화 상태**라(`git rev-list --count <마지막머지>..upstream/main` = 0),
+가져올 게 남아 있던 곳은 **머지되지 않은 커뮤니티 PR** 뿐이었다.
+
+upstream 의 미머지 브랜치 3개(`fix/prevent-window-rename` · `fix/restore-telegramify-markdown-default`
+· `fix/scrub-sensitive-env`)는 `git cherry` 로 확인한 결과 **전부 이미 패치 동등하게 적용**돼
+있었다(SHA 만 다른 PR 잔해). `copilot/*` 는 main 이전의 폐기된 리팩터링이다.
+`codex/codex-remote-agents`(+3,120줄)는 Codex 를 app-server WebSocket 원격 프로토콜로 다시
+붙이는 실험 브랜치라 이 fork 의 OMX 로컬 tmux 방식과 정면 충돌해 **제외**했다.
+
+### Fixed
+
+- **일시적 오류에도 평문으로 재전송해 메시지가 두 번 가던 것** (upstream #93)
+  - `except Exception` 하나로 전부 잡아 평문 재전송했다. `TimedOut`·`NetworkError` 는
+    **이미 도착했을 수도 있는** 모호한 상태라, 재전송하면 서식본 + 평문본 2건이 된다
+  - 이제 `BadRequest`(= 텔레그램이 서식을 거부 → 확실히 미전달)일 때만 평문으로 다시 보낸다
+- **접기 인용이 깨져 원문이 통째로 쏟아지던 것** (upstream #94)
+  - `_render_expandable_quote()` 가 `>line…||` 를 만들었는데, 텔레그램 문법은 첫 줄에
+    `**>` 를 요구한다. 없으면 끝의 `||` 가 짝 없는 spoiler 라 `Can't parse entities` 로
+    전체가 거부되고, 폴백이 **서식 없는 평문 전문**을 그대로 보낸다
+  - thinking · Bash/Grep/Glob/Task/WebFetch 결과 · 여러 줄 에러 · Edit diff 가 전부 이 경로다.
+    "N줄, 탭해서 펼치기" 대신 로그 원문이 매번 채팅에 떨어지고 있었다
+- **상태줄 아래 tip 블록이 끼면 상태를 놓치던 것** (upstream #97)
+  - 구분선 바로 윗줄만 보던 로직이 tip 블록에 막혔다. 위로 더 훑되, 인접하지 않은 위치에서는
+    `…` 를 가진 줄만 상태로 인정한다(일반 출력의 `·` 불릿과 완료 표시 `✻ Sautéed for 7s` 제외)
+- **타이핑 표시가 긴 구간에서 꺼지던 것** (upstream #98)
+  - 텔레그램은 chat action 을 약 5초 뒤 지운다. 상태 메시지를 보낼 때만 한 번 쏘던 방식이라
+    상태 텍스트가 안 바뀌는 동안 표시가 사라졌다. 이제 상태폴링이 4초 주기 keepalive 로 몬다
+- **포럼 토픽에서 "/" 메뉴가 비어 보이던 것** (upstream #99)
+  - 클라이언트는 그 채팅에 맞는 **스코프**를 읽고, 좁은 스코프가 기본을 이긴다. 옛 설정이
+    남긴 `all_private_chats` 목록 하나가 진짜 메뉴를 가렸다. 지울 땐 관리자 스코프까지 넓게,
+    쓸 땐 실제로 쓰는 스코프 전부에 쓴다
+- **워크스페이스 신뢰 대화상자가 새 세션을 막던 것** (upstream #101)
+  - `claude` 실행 전 `~/.claude.json` 에 해당 디렉터리를 신뢰 표시한다.
+    끄려면 `CCBOT_AUTO_TRUST_DIRS=false`
+- **세션 이름이 박힌 테두리를 입력창 구분선으로 못 읽던 것** (upstream #101)
+- **죽은 토픽 상태가 쌓이던 것** (upstream #81) — `/kill` 이 메뉴 힌트로만 등록돼 있어 핸들러
+  없이 Claude Code 로 흘러들어갔다. 실제 핸들러를 붙이고, 토픽이 `/kill` 밖에서 죽었을 때도
+  같은 정리 경로를 타게 했다
+
+### Added
+
+- **보조 메시지 자동 정리** (upstream #94) — thinking · tool_use/tool_result · 로컬 명령 에코 ·
+  사용자 메시지 되울림이 영원히 쌓여 **진짜 답변을 묻었다.** 토픽별로 마지막 "보조" 메시지를
+  추적해 다음 메시지가 오면 지운다. 최종 답변은 추적도 삭제도 하지 않으므로, 턴이 끝나면
+  자연히 답변만 남는다. 병합 태스크·분할 전송은 메시지가 여러 개라 **id 목록**으로 추적한다
+- **타이머 상태 갱신 적응형 스로틀** (upstream #52) — 레이트 리밋 회피
+- **음성 전사 모델 설정** (upstream #91) — OpenAI 호환 백엔드용
+
+### 이 fork 에 맞춰 손본 것
+
+- #98 — upstream 은 chat action 에 thread 를 안 싣는다. 이 fork 는 토픽 모드가 기본이라
+  `_send_kwargs` 로 `message_thread_id` 를 넘긴다. codex 분기도 같은 게이트를 탄다
+- #99 — upstream 은 `post_init` 2곳만 고쳤지만 이 fork 는 스킬 즐겨찾기 토글에서 런타임
+  재등록을 한 번 더 한다. 거기까지 같은 헬퍼를 태워야 토글 뒤 메뉴가 되돌아가지 않는다
+- #94 — upstream 은 콘텐츠 처리 끝에서 `_check_and_send_status` 를 인라인 호출한다.
+  이 fork 는 상태 표시를 `status_polling` 에 넘기며 그 호출을 뺐으므로 되살리지 않았다
+- #81 + #93 — 죽은 토픽 정리(`_maybe_cleanup_dead_topic`)는 `BadRequest` 분기 안쪽에만 둔다.
+  `Topic_id_invalid`·`Message thread not found` 는 `BadRequest` 로 오고, `TimedOut` 으로
+  토픽을 지우면 네트워크가 흔들릴 때마다 멀쩡한 바인딩이 날아간다
+- #97 — fork 고유의 백그라운드 셸 필터(`_BACKGROUND_SHELL_RE`)를 보존했다
+- #99 — `CC_COMMANDS` 에 upstream 이 추가한 5개(agents·context·recap·status·tasks)를 넣되
+  설명은 이 fork 의 한국어 스타일로 맞췄다
+
+### 머지 후 리뷰에서 잡아 고친 것
+
+upstream 패치 자체는 맞지만 **이 fork 의 다른 부분과 겹쳐서 깨지는** 것들이다.
+upstream 테스트로는 안 잡힌다. 전부 `tests/ccbot/test_upstream_merge_fixes.py` 로 고정했고,
+수정을 되돌리는 뮤테이션 4종이 각각 해당 테스트 하나씩을 실패시키는 것까지 확인했다.
+
+- 🚨 **죽은 토픽을 정리해도 타이핑 keepalive 가 살아남아 무한 API 호출** — #81 의
+  `cleanup_dead_topic` 은 세션 상태만 풀고 `clear_topic_state` 를 부르지 않는 **유일한**
+  해제 경로였다(다른 셋은 전부 부른다). #98 이 붙기 전에는 단순 누수였지만, 붙고 나서는
+  `_typing_keepalive` 가 `while True` 라 **텔레그램이 "그 토픽 없다" 고 답한 thread 로
+  4초마다 `send_chat_action` 을 영원히** 던지게 됐다. `cleanup_dead_topic` 이 정리한
+  `(user_id, thread_id)` 목록을 돌려주도록 바꾸고 호출처에서 `clear_topic_state` 를 돌린다
+- **#97 의 8줄 스캔이 `·` 불릿을 상태줄로 읽는 구멍을 비인접 줄에 새로 열었다** — upstream 의
+  통과 조건이 `"…" in line` 하나뿐인데 `·` 는 스피너이면서 **평범한 불릿**이다. Claude 의
+  답변 본문 `· 첫째 항목은…` 이 상태줄이 되고, #98 이 그 값으로 타이핑을 켜므로 유휴 세션에
+  유령 상태 메시지 + 영구 타이핑이 남는다. 비인접 줄은 `…` **그리고** `·` 가 아닐 것을 요구한다.
+  ⚠️ 구분선 **바로 위** 불릿은 main 에도 있던 기존 오탐이라 손대지 않았다(실측 대조 확인)
+- **퍼미션 프롬프트가 떠 있는 내내 "작업 중" 으로 보이던 것** — #98 의 `set_typing` 이
+  `update_status_message` 맨 끝에 한 번뿐인데 그 위에 조기 `return` 이 셋이다. 프롬프트는
+  사람이 답할 때까지 몇 시간도 떠 있고, 실제로는 봇이 **사용자를 기다리는 중**이다.
+  세 지점에서 타이핑을 끈다(큐가 찬 `skip_status` 는 제외 — 에이전트가 실제로 작업 중이다)
+- **secondary 태스크의 이미지가 고아로 남던 것** — #94 가 모으는 id 에 `_send_task_images`
+  가 보낸 사진이 빠져 있었다. `tool_result` 는 항상 secondary 라, 다음 메시지가 오면
+  **설명 텍스트만 지워지고 스크린샷이 맥락 없이 남는다.** `send_photo` 가 message id 를
+  반환하게 하고 전송을 추적보다 먼저 한다
+- **콜백 응답이 최대 45초 지연되던 것** — `_create_and_bind_window` 가 `query.answer()` 를
+  함수 맨 끝에서 불렀는데, 그 앞에 `wait_for_claude_ready`(30초) + `wait_for_session_map_entry`
+  (5~15초)가 있다. 텔레그램은 약 15초를 넘기면 `query is too old` 를 내고, 그 호출엔
+  try/except 가 없어 그대로 터진다. 응답을 **맨 앞**으로 옮겼다(결과 ✅/❌ 는 `safe_edit` 가
+  메시지 본문으로 보여주므로 잃는 정보가 없다)
+- **`TOPIC_CHECK_INTERVAL` docstring 이 60초로 남아 있던 것** — #81 이 5초로 낮췄다.
+  ⚠️ 바인딩 1개당 API 호출이 12배가 되어 #52 의 스로틀과 방향이 반대다. **레이트 리밋을
+  실제로 맞은 관측이 없어** upstream 값을 유지하되, 근거와 되돌리는 값(15~20초)을 주석에 남겼다
+
+### 검증
+
+- `pytest` **440항 통과** (머지 전 400 → upstream 테스트 32 + 이 fork 의 회귀 8)
+- `pyright src/ccbot/` **0 errors**
+- `ruff check src/ tests/` 위반 **103 → 102**. 파일·규칙 단위로 대조해 **main 에 없던 조합은 0건**이고,
+  유일한 증가는 `bot.py` BLE001 12 → 15(#81 `/kill` 핸들러 + #99 스코프 헬퍼 2개)로 그 파일의 기존 스타일과 같다
+
+---
+
 ## [1.0.10] - 2026-09-04
 
 libtmux 의 창·pane 열거를 우회해 `zip() argument 2 is shorter than argument 1` 을 없앤다.

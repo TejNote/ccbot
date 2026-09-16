@@ -15,6 +15,10 @@ Key components:
   - Message queue worker: Background task processing user's queue
   - Content task processing with tool_use/tool_result handling
   - Status message tracking and conversion (keyed by (user_id, thread_id))
+  - Secondary message tracking: the last non-final (thinking/tool_use/
+    tool_result/local_command/user-echo) message per topic is deleted as
+    soon as the next message arrives, so only the final assistant answer
+    is left behind once a turn completes.
 """
 
 import asyncio
@@ -64,6 +68,10 @@ class MessageTask:
     content_type: str = "text"
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    # True for everything except the final assistant text answer (thinking,
+    # tool_use, tool_result, local_command, user-message echo). Secondary
+    # messages are deleted as soon as the next message for the topic arrives.
+    is_secondary: bool = False
 
 
 @dataclass
@@ -94,6 +102,19 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
+
+# Typing keepalive tasks: (user_id, thread_id_or_0) -> repeating chat-action task
+_typing_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+
+# Telegram clears a chat action after ~5s, so refresh just under that.
+TYPING_REFRESH_INTERVAL = 4.0
+
+# Last secondary (non-final) content message(s) per topic, deleted once the
+# next message arrives: (user_id, thread_id_or_0) -> (message_ids, window_id).
+# A list because merged tasks (several secondary entries queued together get
+# folded into one MessageTask by _merge_content_tasks) or a paginated
+# local_command can produce more than one Telegram message per task.
+_secondary_msg_info: dict[tuple[int, int], tuple[list[int], str]] = {}
 
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
@@ -153,7 +174,9 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
         return False
     if candidate.content_type in ("tool_use", "tool_result"):
         return False
-    return True
+    # Never fold a secondary (deletable) message together with the final
+    # answer — the merged task would inherit only one is_secondary value.
+    return base.is_secondary == candidate.is_secondary
 
 
 async def _merge_content_tasks(
@@ -218,6 +241,7 @@ async def _merge_content_tasks(
             tool_use_id=first.tool_use_id,
             content_type=first.content_type,
             thread_id=first.thread_id,
+            is_secondary=first.is_secondary,
         ),
         merge_count,
     )
@@ -353,16 +377,16 @@ def _send_kwargs(thread_id: int | None) -> dict[str, Any]:
     return {}
 
 
-async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
-    """Send images attached to a task, if any."""
+async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> list[int]:
+    """Send images attached to a task, if any. Returns their message ids."""
     if not task.image_data:
-        return
+        return []
     logger.info(
         "Sending %d image(s) in thread %s",
         len(task.image_data),
         task.thread_id,
     )
-    await send_photo(
+    return await send_photo(
         bot,
         chat_id,
         task.image_data,
@@ -449,9 +473,38 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
                     # Fall through to send as new message
 
-    # 2. Send content messages, converting status message to first content part
+    # 2. A new message is arriving for this topic — delete whatever secondary
+    #    (non-final) message was left over from the previous one. Applies
+    #    whether this new task is itself secondary or the final answer: either
+    #    way the old one is now superseded and safe to remove.
+    #
+    #    Remaining (not-yet-deleted) ids are written back before re-raising
+    #    RetryAfter, so _process_content_with_retry's retry of this whole
+    #    task resumes deleting exactly where it left off instead of losing
+    #    track of ids already popped — same reasoning as for a single id,
+    #    just extended to a list (see the flood-control regression test).
+    skey = (user_id, tid)
+    old_secondary = _secondary_msg_info.get(skey)
+    if old_secondary:
+        old_msg_ids, old_wid = old_secondary
+        remaining_ids = list(old_msg_ids)
+        while remaining_ids:
+            old_msg_id = remaining_ids[0]
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+                remaining_ids.pop(0)
+            except RetryAfter:
+                _secondary_msg_info[skey] = (remaining_ids, old_wid)
+                raise
+            except Exception as e:
+                logger.debug("Failed to delete secondary message %d: %s", old_msg_id, e)
+                remaining_ids.pop(0)
+        _secondary_msg_info.pop(skey, None)
+
+    # 3. Send content messages, converting status message to first content part
     first_part = True
     last_msg_id: int | None = None
+    sent_msg_ids: list[int] = []
     for part in task.parts:
         sent = None
 
@@ -467,6 +520,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             )
             if converted_msg_id is not None:
                 last_msg_id = converted_msg_id
+                sent_msg_ids.append(converted_msg_id)
                 continue
 
         sent = await send_with_fallback(
@@ -478,16 +532,32 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
         if sent:
             last_msg_id = sent.message_id
+            sent_msg_ids.append(sent.message_id)
 
-    # 3. Record tool_use message ID for later editing
+    # 4. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
 
-    # 4. Send images if present (from tool_result with base64 image blocks)
-    await _send_task_images(bot, chat_id, task)
+    # 5. Track every message sent for this task as the topic's current
+    #    secondary message(s), so all of them get deleted once the next
+    #    message (of any kind) arrives — not just the last one. A merged
+    #    task (several secondary entries queued together, folded into one
+    #    MessageTask by _merge_content_tasks) or a paginated local_command
+    #    can produce more than one Telegram message here.
+    # 6. Send images if present (from tool_result with base64 image blocks)
+    #    🚨 이미지를 **먼저 보내고** 그 id 까지 함께 추적한다. 예전 순서(추적 → 전송)에서는
+    #       사진 id 가 목록에 안 들어가, 다음 메시지가 오면 **설명 텍스트만 지워지고
+    #       스크린샷이 맥락 없이 남았다.** tool_result 는 항상 is_secondary=True 라
+    #       스크린샷을 찍는 세션에서 매번 재현된다.
+    sent_msg_ids.extend(await _send_task_images(bot, chat_id, task))
+
+    if sent_msg_ids and task.is_secondary:
+        _secondary_msg_info[skey] = (sent_msg_ids, wid)
 
     # Status display is delegated to status_polling (1s interval) so the answer
     # always remains the last visible message until polling detects working state.
+    # 🔎 upstream 은 여기서 _check_and_send_status 를 인라인 호출한다(#94 도 그 자리를
+    #    건드린다). 이 fork 는 그 호출을 의도적으로 뺐으므로 되살리지 않는다.
 
 
 async def _convert_status_to_content(
@@ -502,6 +572,7 @@ async def _convert_status_to_content(
     Returns the message_id if converted successfully, None otherwise.
     """
     skey = (user_id, thread_id_or_0)
+    set_typing(bot, user_id, thread_id_or_0 or None, False)
     info = _status_msg_info.pop(skey, None)
     if not info:
         return None
@@ -549,6 +620,42 @@ async def _convert_status_to_content(
             return None
 
 
+def set_typing(bot: Bot, user_id: int, thread_id: int | None, active: bool) -> None:
+    """Light or clear the typing indicator for a session.
+
+    Status polling is the single caller that knows whether Claude is working,
+    so it drives this. Telegram expires a chat action after ~5s, so an active
+    session needs it re-sent on a timer rather than once per state change.
+    """
+    skey = (user_id, thread_id or 0)
+    if active:
+        if skey not in _typing_tasks:
+            chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+            _typing_tasks[skey] = asyncio.create_task(
+                _typing_keepalive(bot, chat_id, thread_id)
+            )
+        return
+    task = _typing_tasks.pop(skey, None)
+    if task:
+        task.cancel()
+
+
+async def _typing_keepalive(bot: Bot, chat_id: int, thread_id: int | None) -> None:
+    """Re-send the typing chat action until cancelled."""
+    while True:
+        try:
+            await bot.send_chat_action(
+                chat_id=chat_id,
+                action=ChatAction.TYPING,
+                **_send_kwargs(thread_id),  # type: ignore[arg-type]
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"typing keepalive failed for chat {chat_id}: {e}")
+        await asyncio.sleep(TYPING_REFRESH_INTERVAL)
+
+
 async def _process_status_update_task(
     bot: Bot, user_id: int, task: MessageTask
 ) -> None:
@@ -578,16 +685,7 @@ async def _process_status_update_task(
             return
         else:
             # Same window, text changed - edit in place
-            # Send typing indicator when Claude is working
-            if "esc to interrupt" in status_text.lower():
-                try:
-                    await bot.send_chat_action(
-                        chat_id=chat_id, action=ChatAction.TYPING
-                    )
-                except RetryAfter:
-                    raise
-                except Exception:
-                    pass
+            # (타이핑 표시는 set_typing 의 keepalive 가 담당한다 — upstream #98)
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
@@ -636,14 +734,6 @@ async def _do_send_status_message(
     if old:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=old[0])
-        except Exception:
-            pass
-    # Send typing indicator when Claude is working
-    if "esc to interrupt" in text.lower():
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        except RetryAfter:
-            raise
         except Exception:
             pass
     sent = await send_with_fallback(
@@ -712,6 +802,7 @@ async def enqueue_content_message(
     text: str | None = None,
     thread_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
+    is_secondary: bool = False,
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -731,6 +822,7 @@ async def enqueue_content_message(
         content_type=content_type,
         thread_id=thread_id,
         image_data=image_data,
+        is_secondary=is_secondary,
     )
     queue.put_nowait(task)
 
@@ -801,6 +893,15 @@ def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
     """Clear status message tracking for a user (and optionally a specific thread)."""
     skey = (user_id, thread_id or 0)
     _status_msg_info.pop(skey, None)
+    typing = _typing_tasks.pop(skey, None)
+    if typing:
+        typing.cancel()
+
+
+def clear_secondary_msg_info(user_id: int, thread_id: int | None = None) -> None:
+    """Clear secondary-message tracking for a user (and optionally a specific thread)."""
+    skey = (user_id, thread_id or 0)
+    _secondary_msg_info.pop(skey, None)
 
 
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:
@@ -819,6 +920,9 @@ def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> 
 
 async def shutdown_workers() -> None:
     """Stop all queue workers (called during bot shutdown)."""
+    for _, typing in list(_typing_tasks.items()):
+        typing.cancel()
+    _typing_tasks.clear()
     for _, worker in list(_queue_workers.items()):
         worker.cancel()
         try:

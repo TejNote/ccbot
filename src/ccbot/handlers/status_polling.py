@@ -40,7 +40,7 @@ from .interactive_ui import (
     handle_interactive_ui,
 )
 from .cleanup import clear_topic_state
-from .message_queue import enqueue_status_update, get_message_queue
+from .message_queue import enqueue_status_update, get_message_queue, set_typing
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +205,11 @@ async def update_status_message(
     status_line = (
         parse_codex_status_line(pane_text) if is_codex else parse_status_line(pane_text)
     )
+
+    # A parsed status line means the agent is mid-turn — this is the one place
+    # that knows. Telegram clears a chat action after ~5s, so an active session
+    # needs it re-sent on a timer, not once per state change. (upstream #98)
+    set_typing(bot, user_id, thread_id, bool(status_line))
 
     if status_line:
         if not _should_send_status(user_id, thread_id, status_line):

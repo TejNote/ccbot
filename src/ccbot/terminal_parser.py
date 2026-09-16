@@ -267,10 +267,13 @@ _BACKGROUND_SHELL_RE = re.compile(r"\b\d+\s+shells?\s+still\s+running\b")
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
-    The status line (spinner + working text) appears immediately above
-    the chrome separator (a full line of ``─`` characters).  We locate
-    the separator first, then check the line just above it — this avoids
-    false positives from ``·`` bullets in Claude's regular output.
+    The status line (spinner + working text) appears above the chrome
+    separator (a full line of ``─`` characters).  We locate the separator
+    first, then scan upward.  The line *directly* above it counts as a status
+    line on the spinner alone; further up, Claude Code may have rendered a tip
+    block in between, so a spinner line only counts when it also carries the
+    ``…`` of a live status — that keeps ``·`` bullets in regular output and the
+    finished marker (``✻ Sautéed for 7s``) from being mistaken for status.
 
     Returns the text after the spinner, or None if no status line found.
 
@@ -297,12 +300,18 @@ def parse_status_line(pane_text: str) -> str | None:
     if chrome_idx is None:
         return None  # No chrome visible — can't determine status
 
-    # Check lines just above the separator (skip blanks, up to 4 lines)
-    for i in range(chrome_idx - 1, max(chrome_idx - 5, -1), -1):
+    # Scan upward for the spinner line. Claude Code can render a tip block
+    # between the status line and the chrome, so keep looking past non-spinner
+    # lines — but once we're past the line directly above the separator, only a
+    # live status line counts. The ellipsis is what marks one, and it keeps
+    # prose bullets and the finished marker ("✻ Sautéed for 7s") out.
+    # (upstream six-ddc/ccbot#97)
+    adjacent = True
+    for i in range(chrome_idx - 1, max(chrome_idx - 9, -1), -1):
         line = lines[i].strip()
         if not line:
             continue
-        if line[0] in STATUS_SPINNERS:
+        if line[0] in STATUS_SPINNERS and (adjacent or "…" in line):
             rest = line[1:].strip()
             if (
                 _BACKGROUND_SHELL_RE.search(rest)
@@ -310,8 +319,7 @@ def parse_status_line(pane_text: str) -> str | None:
             ):
                 return None
             return rest
-        # First non-empty line above separator isn't a spinner → no status
-        return None
+        adjacent = False
     return None
 
 

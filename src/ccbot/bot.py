@@ -41,6 +41,9 @@ from pathlib import Path
 from telegram import (
     Bot,
     BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -155,12 +158,17 @@ _status_poll_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
+    "agents": "↗ 서브에이전트 관리",
     "clear": "↗ 대화 기록 초기화",
     "compact": "↗ 컨텍스트 압축",
+    "context": "↗ 컨텍스트 사용량 확인",
     "cost": "↗ 토큰/비용 확인",
     "help": "↗ Claude Code 도움말",
     "memory": "↗ CLAUDE.md 편집",
     "model": "↗ AI 모델 전환",
+    "recap": "↗ 이 세션 요약",
+    "status": "↗ 세션 상태 확인",
+    "tasks": "↗ 백그라운드 작업·서브에이전트 목록",
 }
 
 _skill_registry: SkillRegistry | None = None
@@ -225,6 +233,36 @@ _SKILL_DESC_KO: dict[str, str] = {
     # pr-review-toolkit
     "pr_review_toolkit_staged_review": "단계별 코드 리뷰",
 }
+
+
+# 클라이언트는 **그 채팅에 맞는 스코프**를 읽는다. 좁은 스코프가 기본 스코프를 이기므로,
+# 옛 설정(BotFather·구버전)이 남긴 all_private_chats 목록 하나가 진짜 메뉴를 가린다.
+# 그래서 지울 때는 관리자 스코프까지 넓게 지우고, 쓸 때는 실제로 쓰는 스코프에 다 쓴다.
+# (upstream six-ddc/ccbot#99 — 포럼 토픽에서 "/" 버튼이 비어 보이던 문제)
+_COMMAND_WRITE_SCOPES = (
+    None,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+)
+_COMMAND_CLEAR_SCOPES = _COMMAND_WRITE_SCOPES + (BotCommandScopeAllChatAdministrators,)
+
+
+async def _clear_bot_commands(bot: Bot) -> None:
+    """Drop the command menu from every scope we might have written before."""
+    for scope in _COMMAND_CLEAR_SCOPES:
+        try:
+            await bot.delete_my_commands(scope=scope() if scope else None)
+        except Exception as e:
+            logger.warning("delete_my_commands(%s) failed: %s", scope, e)
+
+
+async def _publish_bot_commands(bot: Bot, commands: list[BotCommand]) -> None:
+    """Register the command menu on every scope the bot is used from."""
+    for scope in _COMMAND_WRITE_SCOPES:
+        try:
+            await bot.set_my_commands(commands, scope=scope() if scope else None)
+        except Exception as e:
+            logger.warning("set_my_commands(%s) failed: %s", scope, e)
 
 
 def _build_bot_commands() -> list[BotCommand]:
@@ -1819,7 +1857,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             # Re-register commands with new order
             new_commands = _build_bot_commands()
-            await context.bot.set_my_commands(new_commands)
+            await _publish_bot_commands(context.bot, new_commands)
         else:
             await query.answer("Unknown skill")
 
@@ -2091,7 +2129,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task, _skill_registry
 
-    await application.bot.delete_my_commands()
+    await _clear_bot_commands(application.bot)
 
     # Initialize skill registry and scan plugins
     _skill_registry = SkillRegistry(
@@ -2101,7 +2139,7 @@ async def post_init(application: Application) -> None:
     _skill_registry.scan()
 
     bot_commands = _build_bot_commands()
-    await application.bot.set_my_commands(bot_commands)
+    await _publish_bot_commands(application.bot, bot_commands)
 
     # Delete status messages left over from the previous run (orphaned on restart)
     orphaned = session_manager.pop_all_status_msg_ids()
